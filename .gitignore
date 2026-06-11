@@ -1,0 +1,16 @@
+# build artifacts
+*.o
+*.dylib
+*.so
+*.bc
+
+# dev cluster
+pgdata/
+
+# pg_regress output
+results/
+regression.diffs
+regression.out
+tmp_check/
+
+.DS_Store
