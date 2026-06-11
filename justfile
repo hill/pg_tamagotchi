@@ -1,4 +1,4 @@
-# pgtamagotchi dev commands
+# pg_tamagotchi dev commands
 #
 # Everything is pinned to the Homebrew postgresql@18 keg. The libpq keg also
 # ships a pg_config that shadows this one on PATH but points at a nonexistent
@@ -23,9 +23,9 @@ init:
     {{pg_bin}}/initdb -D {{pgdata}} -U $USER --no-locale -E UTF8
     echo "port = {{port}}" >> {{pgdata}}/postgresql.conf
     echo "listen_addresses = '127.0.0.1'" >> {{pgdata}}/postgresql.conf
-    echo "shared_preload_libraries = 'pgtamagotchi'" >> {{pgdata}}/postgresql.conf
-    echo "pgtamagotchi.tick_interval = 5" >> {{pgdata}}/postgresql.conf
-    echo "pgtamagotchi.database = 'postgres'" >> {{pgdata}}/postgresql.conf
+    echo "shared_preload_libraries = 'pg_tamagotchi'" >> {{pgdata}}/postgresql.conf
+    echo "pg_tamagotchi.tick_interval = 5" >> {{pgdata}}/postgresql.conf
+    echo "pg_tamagotchi.database = 'postgres'" >> {{pgdata}}/postgresql.conf
     echo "log_min_messages = info" >> {{pgdata}}/postgresql.conf
 
 start:
