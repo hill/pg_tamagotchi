@@ -1,0 +1,69 @@
+CREATE EXTENSION pg_tamagotchi;
+-- an unhatched egg
+SELECT tama.status();
+                      status                      
+--------------------------------------------------
+   _____                                         +
+  /     \   a speckled egg sits here, waiting.   +
+  \_____/   SELECT tama.hatch('a name you like');+
+ 
+(1 row)
+
+-- hatching requires a real name
+SELECT tama.hatch(NULL);
+ERROR:  your egg needs a name to hatch
+HINT:  Try SELECT tama.hatch('Blobby');
+SELECT tama.hatch('');
+ERROR:  a pet cannot be named the empty string
+HINT:  Try SELECT tama.hatch('Blobby');
+SELECT tama.hatch('Blobby');
+                      hatch                      
+-------------------------------------------------
+ *crack*                                        +
+  (\_/)                                         +
+  (o.o)  Blobby hatched! Take good care of them.+
+ 
+(1 row)
+
+-- fresh pet vitals
+SELECT tama.status();
+                          status                           
+-----------------------------------------------------------
+  (\_/)                                                   +
+  (o.o)  Blobby                                           +
+  (" ")  hunger 20/100  happiness 80/100  stress 0  poop 0+
+ 
+(1 row)
+
+SELECT name, hunger, happiness, poop, stress FROM tama.pet;
+  name  | hunger | happiness | poop | stress 
+--------+--------+-----------+------+--------
+ Blobby |     20 |        80 |    0 |      0
+(1 row)
+
+-- one pet per database, enforced in C and by the schema
+SELECT tama.hatch('Impostor');
+ERROR:  you already have a pet named Blobby
+HINT:  One pet per database. Care for the one you have.
+INSERT INTO tama.pet (name) VALUES ('Impostor');
+ERROR:  duplicate key value violates unique constraint "pet_pkey"
+DETAIL:  Key (only_one)=(t) already exists.
+-- drop takes every extension object with it, a fresh install gets a fresh egg
+DROP EXTENSION pg_tamagotchi;
+CREATE EXTENSION pg_tamagotchi;
+-- names are data, not SQL
+SELECT tama.hatch('Robert''); DROP TABLE tama.pet;--');
+                                   hatch                                   
+---------------------------------------------------------------------------
+ *crack*                                                                  +
+  (\_/)                                                                   +
+  (o.o)  Robert'); DROP TABLE tama.pet;-- hatched! Take good care of them.+
+ 
+(1 row)
+
+SELECT name FROM tama.pet;
+               name               
+----------------------------------
+ Robert'); DROP TABLE tama.pet;--
+(1 row)
+
