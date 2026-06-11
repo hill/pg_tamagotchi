@@ -91,6 +91,11 @@ LANGUAGE C VOLATILE;
 CREATE FUNCTION status() RETURNS text
 AS 'MODULE_PATHNAME', 'tama_status'
 LANGUAGE C VOLATILE;
+
+-- The pet is communal. The functions run with the caller's privileges,
+-- so everyone needs real access to the schema and the table.
+GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON pet TO PUBLIC;
 ```
 
 A few interesting concepts hide in here.
@@ -100,6 +105,7 @@ A few interesting concepts hide in here.
 - Extension-owned tables are skipped by `pg_dump` on the theory that they're furniture, recreatable from the script. Pet state is not furniture. `pg_extension_config_dump('pet', '')` marks its contents as user data so a backup doesn't kill the pet.
 - `CREATE FUNCTION ... LANGUAGE C` is the bridge to the compiled half. `'MODULE_PATHNAME', 'tama_hatch'` tells Postgres to dlopen the library named in the control file and look up the symbol `tama_hatch`.
 - The single-row-table trick. A `bool` primary key defaulting to `true` with `CHECK (only_one)` can only ever hold one row, since a second insert violates the unique constraint. The schema itself enforces one pet per database.
+- `LANGUAGE C` functions are not `SECURITY DEFINER` by default, they run with the caller's privileges. Without the `GRANT`s, any role other than the installer would get into the function and then hit a raw permission error on the schema. `@extschema@` is substituted with the extension's schema when the script runs.
 
 ### src/pg_tamagotchi.c
 
@@ -108,15 +114,89 @@ The compiled half.
 ```c
 #include "postgres.h"
 
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+
+#include "pg_tamagotchi.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_tamagotchi", .version = "0.1.0");
 
 PG_FUNCTION_INFO_V1(tama_hatch);
 PG_FUNCTION_INFO_V1(tama_status);
+
+int			tama_tick_interval = 10;
+char	   *tama_database = NULL;
+
+void
+_PG_init(void)
+{
+	BackgroundWorker worker;
+
+	/* GUCs are defined whenever the library loads, by any backend */
+	DefineCustomIntVariable("pg_tamagotchi.tick_interval",
+							"Seconds between pet ticks.",
+							NULL,
+							&tama_tick_interval,
+							10, 1, 3600,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_tamagotchi.database",
+							   "Database the pet lives in.",
+							   NULL,
+							   &tama_database,
+							   "postgres",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("pg_tamagotchi");
+
+	/* Workers can only be registered while the postmaster is preloading */
+	if (!process_shared_preload_libraries_in_progress)
+		return;
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+
+	/*
+	 * Never auto-restart. If the configured database doesn't exist the
+	 * worker dies FATAL at connect; a restart interval would turn that
+	 * one log line into an infinite crash loop the operator can only
+	 * stop with a full cluster restart.
+	 */
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	snprintf(worker.bgw_library_name, sizeof(worker.bgw_library_name),
+			 "pg_tamagotchi");
+	snprintf(worker.bgw_function_name, sizeof(worker.bgw_function_name),
+			 "tama_worker_main");
+	snprintf(worker.bgw_name, sizeof(worker.bgw_name), "pg_tamagotchi worker");
+	snprintf(worker.bgw_type, sizeof(worker.bgw_type), "pg_tamagotchi");
+	RegisterBackgroundWorker(&worker);
+}
+
+/*
+ * The pet table, qualified with whatever schema the extension actually
+ * lives in. Hardcoding "tama.pet" would break if the schema is renamed,
+ * and worse, would follow an impostor schema recreated under that name.
+ */
+static char *
+tama_pet_relname(void)
+{
+	Oid			extoid = get_extension_oid("pg_tamagotchi", false);
+	char	   *nspname = get_namespace_name(get_extension_schema(extoid));
+
+	return psprintf("%s.pet", quote_identifier(nspname));
+}
 
 Datum
 tama_hatch(PG_FUNCTION_ARGS)
@@ -148,22 +228,37 @@ tama_hatch(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 
-	ret = SPI_execute("SELECT name FROM tama.pet", true, 1);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "could not check for an existing pet");
-	if (SPI_processed > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNIQUE_VIOLATION),
-				 errmsg("you already have a pet named %s",
-						SPI_getvalue(SPI_tuptable->vals[0],
-									 SPI_tuptable->tupdesc, 1)),
-				 errhint("One pet per database. Care for the one you have.")));
-
+	/*
+	 * The insert itself is the authority on whether a pet exists. A
+	 * separate check-then-insert would race against concurrent hatches
+	 * and read a stale snapshot when called twice in one statement.
+	 */
 	values[0] = PointerGetDatum(name);
-	ret = SPI_execute_with_args("INSERT INTO tama.pet (name) VALUES ($1)",
-								1, argtypes, values, NULL, false, 0);
+	ret = SPI_execute_with_args(
+		psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
+				 tama_pet_relname()),
+		1, argtypes, values, NULL, false, 0);
 	if (ret != SPI_OK_INSERT)
 		elog(ERROR, "the egg refused to hatch");
+
+	if (SPI_processed == 0)
+	{
+		ret = SPI_execute(psprintf("SELECT name FROM %s", tama_pet_relname()),
+						  false, 1);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not look in on the pet");
+		if (SPI_processed > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNIQUE_VIOLATION),
+					 errmsg("you already have a pet named %s",
+							SPI_getvalue(SPI_tuptable->vals[0],
+										 SPI_tuptable->tupdesc, 1)),
+					 errhint("One pet per database. Care for the one you have.")));
+		ereport(ERROR,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg("you already have a pet"),
+				 errhint("One pet per database. Care for the one you have.")));
+	}
 
 	appendStringInfo(&buf,
 					 "*crack*\n"
@@ -186,8 +281,9 @@ tama_status(PG_FUNCTION_ARGS)
 
 	SPI_connect();
 
-	ret = SPI_execute("SELECT name, hunger, happiness, poop, stress"
-					  " FROM tama.pet", true, 1);
+	ret = SPI_execute(psprintf("SELECT name, hunger, happiness, poop, stress"
+							   " FROM %s", tama_pet_relname()),
+					  false, 1);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "could not look in on the pet");
 
@@ -237,11 +333,19 @@ This file is dense with Postgres internals.
 
 ```make
 MODULE_big = pg_tamagotchi
-OBJS = src/pg_tamagotchi.o
+OBJS = src/pg_tamagotchi.o src/worker.o
 EXTENSION = pg_tamagotchi
 DATA = pg_tamagotchi--0.1.0.sql
 PGFILEDESC = "pg_tamagotchi - a tamagotchi that lives in your database"
+# Only tests that pass on any cluster. The worker test needs
+# shared_preload_libraries, so `just test` opts in with
+# REGRESS="basic worker" against the dev cluster.
 REGRESS = basic
+
+# Apple clang doesn't know the syslog format archetype used by PG's
+# printf attributes; without this every build emits 31 copies of the
+# same harmless warning.
+PG_CFLAGS = -Wno-ignored-attributes
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -257,3 +361,99 @@ A handful of declarations handed to PGXS, the build system that ships inside Pos
 - `include $(PGXS)` - pull in Postgres's makefile, which knows the server's exact compiler flags and provides `make install` / `make installcheck`
 
 `make install` copies the control file and SQL script into `sharedir/extension/` and the library into `pkglibdir`. That's the whole trick, `CREATE EXTENSION` is a filesystem lookup followed by running a SQL script.
+
+## The background worker
+
+A real tamagotchi gets hungry while you're not looking. SQL functions only run when called, so the aging logic needs a process of its own. Postgres has exactly this concept, the background worker. The postmaster starts it, supervises it, and restarts it if it crashes. Autovacuum and logical replication run on the same machinery, and extensions get to use it too.
+
+The worker lives in `src/worker.c`. Registration happens in `_PG_init` above.
+
+```c
+#include "postgres.h"
+
+#include "miscadmin.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/latch.h"
+#include "tcop/tcopprot.h"
+#include "utils/guc.h"
+#include "utils/wait_event.h"
+
+#include "pg_tamagotchi.h"
+
+PGDLLEXPORT void tama_worker_main(Datum main_arg);
+
+static void
+tama_tick(void)
+{
+	elog(LOG, "pg_tamagotchi: tick");
+}
+
+void
+tama_worker_main(Datum main_arg)
+{
+	uint32		wait_event_info;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+
+	BackgroundWorkerInitializeConnection(tama_database, NULL, 0);
+
+	wait_event_info = WaitEventExtensionNew("PgTamagotchiMain");
+
+	elog(LOG, "pg_tamagotchi: worker started, the pet lives in database \"%s\"",
+		 tama_database);
+
+	for (;;)
+	{
+		tama_tick();
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 tama_tick_interval * 1000L,
+						 wait_event_info);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+	}
+}
+```
+
+The tick is a placeholder for now, it just logs. The interesting parts are around it.
+
+- **Registration only works at preload.** Workers must be registered while the postmaster processes `shared_preload_libraries`, so the library has to be in that list and changing it needs a full restart. A replaced library file on disk also only takes effect at restart, because every backend inherits the postmaster's already-loaded image via fork.
+- **The registration struct does a lot.** `bgw_type` becomes `backend_type` in `pg_stat_activity`. `BGWORKER_BACKEND_DATABASE_CONNECTION` lets it connect to one database like a real backend, which is what `pg_tamagotchi.database` points at. `bgw_restart_time` is a trap, a restart interval sounds like resilience, but if the configured database doesn't exist the worker dies FATAL at connect and the postmaster would relaunch it into the same FATAL forever. `BGW_NEVER_RESTART` keeps a misconfiguration at one log line, and it's what the in-tree `worker_spi` example uses too.
+- **The nap is a latch, not a sleep.** `WaitLatch` wakes on a timeout like sleep would, but also instantly when something sets the latch, like the signal handlers do. Shutdown is immediate instead of "up to tick_interval later". `WL_EXIT_ON_PM_DEATH` kills the worker if the postmaster vanishes, so it can never outlive the server.
+- **Named wait events.** `WaitEventExtensionNew("PgTamagotchiMain")` registers the name monitoring tools see while the worker naps. Our pet shows up in `pg_stat_activity` as `Extension / PgTamagotchiMain`, right next to the built-in wait events.
+- **Signals are flags, mostly.** SIGHUP sets `ConfigReloadPending` and the loop reloads config when it notices. SIGTERM is wired to `die`, the standard backend handler, which raises FATAL at the next `CHECK_FOR_INTERRUPTS()`. The shutdown log line reads `FATAL: terminating background worker "pg_tamagotchi" due to administrator command`, which looks alarming and is the system working as designed.
+- **GUCs are real settings.** `DefineCustomIntVariable` gives `pg_tamagotchi.tick_interval` bounds, units (you can write `'30s'` or `'5min'`), and a change policy. `PGC_SIGHUP` means a config reload is enough, and the worker picks the new value up on its next nap. The database setting is `PGC_POSTMASTER` because the worker connects exactly once at startup. `MarkGUCPrefixReserved` turns misspelled settings into warnings instead of silent no-ops.
+
+Proof of life.
+
+```
+$ just log
+LOG:  pg_tamagotchi: worker started, the pet lives in database "postgres"
+LOG:  pg_tamagotchi: tick
+LOG:  pg_tamagotchi: tick
+
+$ psql -c "SELECT pid, backend_type, datname, wait_event FROM pg_stat_activity
+           WHERE backend_type = 'pg_tamagotchi';"
+  pid  | backend_type  | datname  |    wait_event
+-------+---------------+----------+------------------
+ 64708 | pg_tamagotchi | postgres | PgTamagotchiMain
+```
+
+## Sharp edges an adversarial review caught
+
+<!-- notes; a fleet of review agents went over the C and confirmed these, each is a concept worth a paragraph -->
+
+- Check-then-insert is a race. The original `hatch()` did SELECT then INSERT, so two concurrent hatches both passed the check and the loser got a raw `pet_pkey` violation instead of the friendly error. Worse, the check ran with `read_only=true`, which reuses the statement's snapshot, so `SELECT tama.hatch(n) FROM (VALUES ('a'),('b')) v(n)` slipped past it too. `INSERT ... ON CONFLICT DO NOTHING` made the insert itself the authority.
+- A worker restart interval sounds like resilience and is actually a crash loop when the failure is deterministic, like a missing database. `BGW_NEVER_RESTART`.
+- C functions run with the caller's privileges. Defaults gave other roles EXECUTE on the functions but no access to the schema behind them, a confusing half-open door. The script now grants real access on purpose.
+- Hardcoding `tama.pet` in the C breaks if someone renames the schema, and the extension can't stop them, the schema isn't an extension member even though `CREATE EXTENSION` made it. The C now resolves the schema from the catalogs (`get_extension_oid`, `get_extension_schema`) at call time.

@@ -25,3 +25,8 @@ LANGUAGE C VOLATILE;
 CREATE FUNCTION status() RETURNS text
 AS 'MODULE_PATHNAME', 'tama_status'
 LANGUAGE C VOLATILE;
+
+-- The pet is communal. The functions run with the caller's privileges,
+-- so everyone needs real access to the schema and the table.
+GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON pet TO PUBLIC;

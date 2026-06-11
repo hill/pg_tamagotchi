@@ -50,7 +50,7 @@ log:
     tail -f {{pgdata}}/server.log
 
 test: install
-    PGHOST=127.0.0.1 PGPORT={{port}} make installcheck PG_CONFIG={{pg_config}}
+    PGHOST=127.0.0.1 PGPORT={{port}} make installcheck PG_CONFIG={{pg_config}} REGRESS="basic worker"
 
 clean:
     make clean PG_CONFIG={{pg_config}}
