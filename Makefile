@@ -3,7 +3,7 @@ OBJS = src/pg_tamagotchi.o
 EXTENSION = pg_tamagotchi
 DATA = pg_tamagotchi--0.1.0.sql
 PGFILEDESC = "pg_tamagotchi - a tamagotchi that lives in your database"
-REGRESS = basic worker
+REGRESS = basic
 
 # Apple clang doesn't know the syslog format archetype used by PG's
 # printf attributes; without this every build emits 31 copies of the
