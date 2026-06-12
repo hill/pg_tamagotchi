@@ -143,7 +143,11 @@ PG_FUNCTION_INFO_V1(tama_status);
 
 int			tama_tick_interval = 10;
 char	   *tama_database = NULL;
+```
 
+`_PG_init` runs once when the library loads. It defines two GUCs (Postgres's name for server settings) and registers the background worker.
+
+```c
 void
 _PG_init(void)
 {
@@ -193,7 +197,11 @@ _PG_init(void)
 	snprintf(worker.bgw_type, sizeof(worker.bgw_type), "pg_tamagotchi");
 	RegisterBackgroundWorker(&worker);
 }
+```
 
+A small helper resolves the extension's actual schema at runtime, rather than hardcoding `tama.pet`.
+
+```c
 /*
  * The pet table, qualified with whatever schema the extension actually
  * lives in. Hardcoding "tama.pet" would break if the schema is renamed,
@@ -207,7 +215,11 @@ tama_pet_relname(void)
 
 	return psprintf("%s.pet", quote_identifier(nspname));
 }
+```
 
+When `hatch()` is called with no argument, a pronounceable name is minted from syllable parts using Postgres's own PRNG.
+
+```c
 /* Syllable parts for minting names. Every combination is pronounceable. */
 static const char *const name_onsets[] = {
 	"b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n",
@@ -246,7 +258,11 @@ tama_random_name(void)
 
 	return buf.data;
 }
+```
 
+`tama_hatch` is the C side of `SELECT tama.hatch('Ludo')`. It picks a name (taking the argument or minting one), attempts a single insert, and renders some ASCII.
+
+```c
 Datum
 tama_hatch(PG_FUNCTION_ARGS)
 {
@@ -316,7 +332,11 @@ tama_hatch(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
+```
 
+`tama_status` is the read counterpart. It selects the single row and renders either an egg or a pet.
+
+```c
 Datum
 tama_status(PG_FUNCTION_ARGS)
 {
@@ -376,6 +396,8 @@ The big ideas in this file.
 - **Randomness comes from `pg_prng`.** Postgres ships its own PRNG, and a nameless egg uses it to mint a pronounceable name from syllable parts.
 
 ### Makefile
+
+PGXS, short for PostgreSQL Extension Building Infrastructure, is a Make include that ships with Postgres. It knows the server's exact compiler flags, install paths, and pg_regress invocations, so an extension's own Makefile only needs to declare a handful of variables and include PGXS at the bottom.
 
 ```make
 MODULE_big = pg_tamagotchi
@@ -451,7 +473,7 @@ tama_worker_main(Datum main_arg)
 	elog(LOG, "pg_tamagotchi: worker started, the pet lives in database \"%s\"",
 		 tama_database);
 
-	for (;;)
+	while (true)
 	{
 		tama_tick();
 

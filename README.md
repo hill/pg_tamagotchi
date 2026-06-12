@@ -32,8 +32,7 @@ Without the worker the extension still loads and the SQL functions work, the pet
 CREATE EXTENSION pg_tamagotchi;
 
 SELECT tama.status();          -- a speckled egg, waiting
-SELECT tama.hatch('Blobby');   -- every pet needs a name
-SELECT tama.hatch();           -- skip the name and one is invented
+SELECT tama.hatch('Blobby');   -- every pet needs a name (optionally leave blank and it will be invented)
 SELECT tama.status();          -- check in on them
 ```
 

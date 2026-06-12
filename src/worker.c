@@ -34,7 +34,7 @@ tama_worker_main(Datum main_arg)
 	elog(LOG, "pg_tamagotchi: worker started, the pet lives in database \"%s\"",
 		 tama_database);
 
-	for (;;)
+	while (true)
 	{
 		tama_tick();
 
