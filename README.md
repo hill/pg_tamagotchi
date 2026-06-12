@@ -1,5 +1,9 @@
 # pg_tamagotchi
 
+<p align="center">
+  <img src="assets/readme-hero.png" alt="pg_tamagotchi PostgreSQL elephant virtual pet" />
+</p>
+
 A tamagotchi that lives in your Postgres database. Hatch it, name it, feed it, and try not to let a restore kill it.
 
 ## Requirements
