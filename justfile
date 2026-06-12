@@ -18,14 +18,11 @@ build:
 install: build
     make install PG_CONFIG={{pg_config}}
 
-# Create the throwaway dev cluster with the extension preloaded
+# Create the throwaway dev cluster
 init:
     {{pg_bin}}/initdb -D {{pgdata}} -U $USER --no-locale -E UTF8
     echo "port = {{port}}" >> {{pgdata}}/postgresql.conf
     echo "listen_addresses = '127.0.0.1'" >> {{pgdata}}/postgresql.conf
-    echo "shared_preload_libraries = 'pg_tamagotchi'" >> {{pgdata}}/postgresql.conf
-    echo "pg_tamagotchi.tick_interval = 5" >> {{pgdata}}/postgresql.conf
-    echo "pg_tamagotchi.database = 'postgres'" >> {{pgdata}}/postgresql.conf
     echo "log_min_messages = info" >> {{pgdata}}/postgresql.conf
 
 start:
@@ -50,7 +47,7 @@ log:
     tail -f {{pgdata}}/server.log
 
 test: install
-    PGHOST=127.0.0.1 PGPORT={{port}} make installcheck PG_CONFIG={{pg_config}} REGRESS="basic worker"
+    PGHOST=127.0.0.1 PGPORT={{port}} make installcheck PG_CONFIG={{pg_config}}
 
 clean:
     make clean PG_CONFIG={{pg_config}}

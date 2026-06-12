@@ -7,7 +7,7 @@ You don't need redis, elasticsearch, pinecone, arcgis or a $5000/month bill!
 - Full text search = `pg_textsearch`
 - Vector database = `pg_vector`
 - Cache store = `UNLOGGED` tables
-- NoSQL/documnents = `JSONB`
+- NoSQL/documents = `JSONB`
 - Geospatial Database = `postgis`
 - Queues = `pgmq`
 - Cronjobs = `pg_cron`
@@ -15,16 +15,15 @@ You don't need redis, elasticsearch, pinecone, arcgis or a $5000/month bill!
 - GraphQL = `postGraphile`
 ...
 
-I love Postgres! But you know what's missing from this list? Tamagotchi implemented as a postgres extension. 
+I love Postgres! But you know what's missing from this list? Tamagotchi implemented as a postgres extension.
 
 Therefore, introducing...
 
 ## pg_tamagotchi
 
-pg_tamagotchi is your pet in postgres. You hatch it, name it, feed it, clean up it's shit and love and care for it.
+pg_tamagotchi is your pet in postgres. You hatch it, name it, feed it, clean up its shit and love and care for it.
 
-A pet's happiness usually is correlated with its environment,
-so we also monitor postgres statistics and your pet will respond.
+A pet's happiness depends on its environment, so we also monitor postgres statistics and your pet will respond.
 
 ### Care instructions
 
@@ -34,13 +33,16 @@ CREATE EXTENSION pg_tamagotchi;
 SELECT tama.status();          -- a speckled egg, waiting
 SELECT tama.hatch('Ludo');     -- every pet needs a name
 -- (skip the argument and a pronounceable name is invented)
+SELECT tama.feed('apple');     -- snacks help
+SELECT tama.talk('hello?');    -- the pet talks back
 SELECT tama.status();          -- check in on them
 ```
 
+That's the whole setup. The pet ages whenever someone checks in, and conversations are stored in the database with the pet.
 
 ## What is a Postgres Extension?
 
-An extension is a name that ties together three artifacts.
+For a C-backed extension like this one, an extension is a name that ties together three artifacts.
 
 1. A **control file** declaring the extension exists.
 2. A **SQL script** that creates the schema, tables, and function signatures.
@@ -48,7 +50,7 @@ An extension is a name that ties together three artifacts.
 
 `CREATE EXTENSION pg_tamagotchi` finds them by name in Postgres's install directories and wires them into the database.
 
-_"Install directories"_ are the fixed locations on disk that pg will look for extension files. `pg_config --sharedir` will print the path for the _sharedir_ - where the control file and SQL scripts live. `pg_config --pkglibdir` is the directory where the compiled shared libraries (e.g. `.so` or `.dylib`) live.
+_"Install directories"_ are the fixed locations on disk that pg will look for extension files. `pg_config --sharedir` will print the path for the _sharedir_, where the control file and SQL scripts live. `pg_config --pkglibdir` is the directory where the compiled shared libraries, e.g. `.so` or `.dylib`, live.
 
 ### pg_tamagotchi.control
 
@@ -85,16 +87,32 @@ CREATE TABLE pet (
     poop            bigint NOT NULL DEFAULT 0,
     stress          int NOT NULL DEFAULT 0,
     cache_hit_ratio float8,
-    last_tick_at    timestamptz
+    last_tick_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Conversation history with the pet. This is user data too.
+CREATE TABLE message (
+    said_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    speaker text NOT NULL CHECK (speaker IN ('you', 'pet')),
+    body text NOT NULL
 );
 
 -- Pet state is user data, not extension furniture: include it in pg_dump
 -- so the pet survives backup and restore.
 SELECT pg_catalog.pg_extension_config_dump('pet', '');
+SELECT pg_catalog.pg_extension_config_dump('message', '');
 
 -- With no name, a pronounceable one is invented.
 CREATE FUNCTION hatch(name text DEFAULT NULL) RETURNS text
 AS 'MODULE_PATHNAME', 'tama_hatch'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION feed(food text DEFAULT NULL) RETURNS text
+AS 'MODULE_PATHNAME', 'tama_feed'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION talk(message text DEFAULT NULL) RETURNS text
+AS 'MODULE_PATHNAME', 'tama_talk'
 LANGUAGE C VOLATILE;
 
 CREATE FUNCTION status() RETURNS text
@@ -105,116 +123,128 @@ LANGUAGE C VOLATILE;
 -- so everyone needs real access to the schema and the table.
 GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON pet TO PUBLIC;
+GRANT SELECT, INSERT ON message TO PUBLIC;
 ```
-
 
 - The `name--version.sql` naming is how upgrades work. Postgres chains `0.1.0--0.2.0` scripts between versions itself.
 - Everything the script creates is owned by the extension, and `DROP EXTENSION` takes it all with it.
-- Extension tables are skipped by `pg_dump` unless marked as user data with `pg_extension_config_dump`, so the pet survives backups.
+- `pg_dump` emits `CREATE EXTENSION` instead of dumping extension-owned objects directly. `pg_extension_config_dump` marks the pet and message tables as user data, so both survive backups.
 - `LANGUAGE C` functions point at a symbol in the compiled library.
 - The bool primary key with a CHECK means the table can only ever hold one row. One pet per database, enforced by the schema itself.
+- `last_tick_at` is the pet's clock. Since it is ordinary table state, it survives backup and restore with the rest of the pet.
+- `message` is the conversation log. `tama.talk()` writes one row for you and one row for the pet's reply.
 - The functions run with the caller's privileges, so the script grants access. The pet is communal.
 
 ### src/pg_tamagotchi.c
 
-This is the compile C source code that function signatures link to.
+This is the C source code that function signatures link to.
 
 ```c
 #include "postgres.h"
+
+#include <string.h>
 
 #include "commands/extension.h"
 #include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
-#include "miscadmin.h"
-#include "postmaster/bgworker.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
+#include "utils/float.h"
 #include "utils/lsyscache.h"
-
-#include "pg_tamagotchi.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_tamagotchi", .version = "0.1.0");
 
 PG_FUNCTION_INFO_V1(tama_hatch);
+PG_FUNCTION_INFO_V1(tama_feed);
+PG_FUNCTION_INFO_V1(tama_talk);
 PG_FUNCTION_INFO_V1(tama_status);
 
-int tama_tick_interval = 10;
-char *tama_database = NULL;
+#define TAMA_TICK_SECONDS 10
 ```
 
-`_PG_init` runs once when the library loads. It defines two GUCs (Postgres's name for server settings) and registers the background worker.
-
-```c
-/* Define GUCs and, when preloading, register the background worker. */
-void _PG_init(void) {
-  BackgroundWorker worker;
-
-  /* GUCs are defined whenever the library loads, by any backend */
-  DefineCustomIntVariable("pg_tamagotchi.tick_interval",
-                          "Seconds between pet ticks.",
-                          NULL,
-                          &tama_tick_interval,
-                          10, 1, 3600,
-                          PGC_SIGHUP,
-                          GUC_UNIT_S,
-                          NULL, NULL, NULL);
-
-  DefineCustomStringVariable("pg_tamagotchi.database",
-                             "Database the pet lives in.",
-                             NULL,
-                             &tama_database,
-                             "postgres",
-                             PGC_POSTMASTER,
-                             0,
-                             NULL, NULL, NULL);
-
-  MarkGUCPrefixReserved("pg_tamagotchi");
-
-  /* Workers can only be registered while the postmaster is preloading */
-  if (!process_shared_preload_libraries_in_progress) {
-    return;
-  }
-
-  memset(&worker, 0, sizeof(worker));
-  worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-  worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-
-  /*
-   * Never auto-restart. If the configured database doesn't exist the
-   * worker dies FATAL at connect; a restart interval would turn that
-   * one log line into an infinite crash loop the operator can only
-   * stop with a full cluster restart.
-   */
-  worker.bgw_restart_time = BGW_NEVER_RESTART;
-  snprintf(worker.bgw_library_name, sizeof(worker.bgw_library_name),
-           "pg_tamagotchi");
-  snprintf(worker.bgw_function_name, sizeof(worker.bgw_function_name),
-           "tama_worker_main");
-  snprintf(worker.bgw_name, sizeof(worker.bgw_name), "pg_tamagotchi worker");
-  snprintf(worker.bgw_type, sizeof(worker.bgw_type), "pg_tamagotchi");
-  RegisterBackgroundWorker(&worker);
-}
-```
-
-A small helper resolves the extension's actual schema at runtime, rather than hardcoding `tama.pet`.
+A small helper resolves the extension's actual schema at runtime, rather than hardcoding `tama.pet` or `tama.message`.
 
 ```c
 /*
- * The pet table, qualified with whatever schema the extension actually
- * lives in. Hardcoding "tama.pet" would break if the schema is renamed,
- * and worse, would follow an impostor schema recreated under that name.
+ * A table qualified with whatever schema the extension actually lives in.
+ * Hardcoding "tama.pet" would break if the schema is renamed, and worse,
+ * would follow an impostor schema recreated under that name.
  */
-char *tama_pet_relname(void) {
+static char *tama_relname(const char *relname) {
   Oid extoid = get_extension_oid("pg_tamagotchi", false);
   char *nspname = get_namespace_name(get_extension_schema(extoid));
 
-  return psprintf("%s.pet", quote_identifier(nspname));
+  return psprintf("%s.%s", quote_identifier(nspname), quote_identifier(relname));
+}
+
+static char *tama_pet_relname(void) {
+  return tama_relname("pet");
+}
+
+static char *tama_message_relname(void) {
+  return tama_relname("message");
 }
 ```
 
-`tama_hatch` is the C side of `SELECT tama.hatch('Ludo')`. It picks a name (taking the argument or minting one), attempts a single insert, and renders some ASCII.
+The tick is the pet's heartbeat. It runs when someone checks `status()`, catches up by however many ten-second intervals have elapsed, and samples a few Postgres statistics.
+
+- dead tuples = poop, and `VACUUM` is the pooper scooper
+- cache hit ratio = environment
+- sessions sitting idle in transaction = stress
+- hunger climbs one point per tick
+
+```c
+/*
+ * One beat of the pet's life. Time is caught up lazily when someone checks
+ * on the pet, so CREATE EXTENSION is enough to make it age.
+ */
+static void tama_tick(void) {
+  char *relname = tama_pet_relname();
+  int ret;
+
+  ret = SPI_execute(psprintf(
+    "WITH tick AS ("
+    "  SELECT only_one,"
+    "         greatest(0, floor(extract(epoch FROM"
+    "           (clock_timestamp() - last_tick_at)) / %d))::int AS elapsed"
+    "  FROM %s"
+    "  FOR UPDATE"
+    ") "
+    "UPDATE %s p SET"
+    "  hunger = least(p.hunger + tick.elapsed, 100),"
+    "  poop = (SELECT coalesce(sum(n_dead_tup), 0)"
+    "          FROM pg_stat_user_tables),"
+    "  cache_hit_ratio = (SELECT blks_hit::float8"
+    "                            / nullif(blks_hit + blks_read, 0)"
+    "                     FROM pg_stat_database"
+    "                     WHERE datname = current_database()),"
+    "  stress = (SELECT count(*) FROM pg_stat_activity"
+    "            WHERE state = 'idle in transaction'),"
+    "  last_tick_at = CASE WHEN tick.elapsed > 0"
+    "    THEN p.last_tick_at + tick.elapsed * (%d * interval '1 second')"
+    "    ELSE p.last_tick_at"
+    "  END"
+    " FROM tick"
+    " WHERE p.only_one = tick.only_one",
+    TAMA_TICK_SECONDS, relname, relname, TAMA_TICK_SECONDS), false, 0);
+
+  if (ret != SPI_OK_UPDATE) {
+    elog(ERROR, "pg_tamagotchi: tick failed");
+  }
+}
+```
+
+The big ideas in the tick.
+
+- **The clock is data.** The pet does not need a separate process. `last_tick_at` records the last time its state advanced, and the next `status()` applies the missing time.
+- **The row lock is the timer guard.** `FOR UPDATE` locks the one pet row while elapsed time is calculated, so two people checking in at once do not both charge the same missing ticks.
+- **The stats are just tables.** `pg_stat_user_tables`, `pg_stat_database`, and `pg_stat_activity` are queryable like anything else, so one UPDATE harvests them all.
+- **Dead tuples are old row versions.** Updates and deletes leave them behind until vacuum cleans them up. That maps cleanly to pet poop.
+- **Idle transactions are stressful.** A session sitting idle in transaction can hold old snapshots open and interfere with cleanup, so the pet notices.
+- **Use wall clock time.** `clock_timestamp()` is the actual time right now. That's what a pet wants.
+
+`tama_hatch` is the C side of `SELECT tama.hatch('Ludo')`. It picks a name, attempts a single insert, and renders some ASCII.
 
 ```c
 /* SELECT tama.hatch(name). Creates the pet, refuses if one already exists. */
@@ -291,7 +321,52 @@ Datum tama_hatch(PG_FUNCTION_ARGS) {
 }
 ```
 
-`tama_status` is the read counterpart. It selects the single row and renders either an egg or a pet.
+`tama_feed` is another small state transition. It catches the pet up first, lowers hunger, nudges happiness up, and returns the new vitals.
+
+```c
+ret = SPI_execute(psprintf(
+  "UPDATE %s SET"
+  "  hunger = greatest(hunger - 25, 0),"
+  "  happiness = least(happiness + CASE WHEN hunger > 0 THEN 5 ELSE 1 END, 100)"
+  " RETURNING name, hunger, happiness",
+  tama_pet_relname()), false, 1);
+```
+
+So feeding from SQL looks like this.
+
+```
+postgres=# SELECT tama.feed('apple');
+                         feed
+------------------------------------------------------
+ Ludo munches the apple. hunger 0/100  happiness 85/100
+```
+
+`tama_talk` reads the current pet state, chooses a reply, and stores the exchange in `tama.message`.
+
+```c
+if (message_cstr != NULL) {
+  tama_log_message("you", message_cstr);
+}
+tama_log_message("pet", reply);
+```
+
+The reply is deliberately local and deterministic. No network call, no model, no surprise dependency. The pet talks back from the state already in Postgres.
+
+```
+postgres=# SELECT tama.talk('how are you?');
+                                  talk
+------------------------------------------------------------------------
+ you: how are you?
+ Ludo says: That is a very good question for a tiny database pet.
+
+postgres=# SELECT speaker, body FROM tama.message ORDER BY said_at;
+ speaker |                                body
+---------+--------------------------------------------------------------------
+ you     | how are you?
+ pet     | Ludo says: That is a very good question for a tiny database pet.
+```
+
+`tama_status` is the read counterpart. It advances the pet, selects the single row, and renders either an egg or the pet's vitals.
 
 ```c
 /* SELECT tama.status(). Renders the unhatched egg or the pet's vitals. */
@@ -302,6 +377,8 @@ Datum tama_status(PG_FUNCTION_ARGS) {
   initStringInfo(&buf);
 
   SPI_connect();
+
+  tama_tick();
 
   ret = SPI_execute(psprintf("SELECT name, hunger, happiness, poop, stress"
                              " FROM %s", tama_pet_relname()),
@@ -339,13 +416,35 @@ Datum tama_status(PG_FUNCTION_ARGS) {
 }
 ```
 
+The big ideas in the C.
 
 - **The magic block.** `PG_MODULE_MAGIC_EXT` stamps the library with the Postgres version it was built for, and the server refuses to load a mismatch.
 - **The V1 calling convention.** Every value crossing the SQL/C boundary is a `Datum`, and the `PG_GETARG_*` / `PG_RETURN_*` macros pack and unpack them.
 - **Errors don't return.** `ereport(ERROR)` longjmps out and aborts the transaction. No cleanup code needed, because everything was palloc'd in a memory context the abort destroys wholesale.
 - **SPI** is how C runs SQL inside the server, the same machinery PL/pgSQL uses. With `$1` parameters the pet's name is data, not SQL, so Bobby Tables is just a pet.
 - **Concurrency is settled by the index.** `ON CONFLICT DO NOTHING` makes the insert itself the authority on whether a pet exists, no racy check-then-insert.
+- **The conversation is table state.** `tama.message` is owned by the extension but dumped as user data, just like the pet.
 - **Ask the catalogs where you live.** The C resolves the extension's schema at call time instead of hardcoding `tama`, so a renamed schema doesn't break anything.
+
+And now the pet responds to how the database is treated.
+
+```
+postgres=# SELECT tama.status();
+                          status
+-----------------------------------------------------------
+  (\_/)
+  (o.o)  Ticktock
+  (" ")  hunger 22/100  happiness 80/100  stress 0  poop 6
+
+postgres=# CREATE TABLE junk AS SELECT generate_series(1,1000) g;
+postgres=# DELETE FROM junk;
+-- check in later, poop = 1006
+
+postgres=# VACUUM junk;
+-- check in later, poop = 6
+```
+
+Leave a transaction hanging open in another terminal and stress climbs. Commit it and the pet calms down. The pet is a database monitor with feelings.
 
 ### Makefile
 
@@ -353,13 +452,10 @@ PGXS, short for PostgreSQL Extension Building Infrastructure, is a Make include 
 
 ```make
 MODULE_big = pg_tamagotchi
-OBJS = src/pg_tamagotchi.o src/worker.o
+OBJS = src/pg_tamagotchi.o
 EXTENSION = pg_tamagotchi
 DATA = pg_tamagotchi--0.1.0.sql
 PGFILEDESC = "pg_tamagotchi - a tamagotchi that lives in your database"
-# Only tests that pass on any cluster. The worker test needs
-# shared_preload_libraries, so `just test` opts in with
-# REGRESS="basic worker" against the dev cluster.
 REGRESS = basic
 
 # Apple clang doesn't know the syslog format archetype used by PG's
@@ -382,192 +478,11 @@ A handful of declarations handed to PGXS, the build system that ships inside Pos
 
 `make install` copies the control file and SQL script into `sharedir/extension/` and the library into `pkglibdir`. That's the whole trick, `CREATE EXTENSION` is a filesystem lookup followed by running a SQL script.
 
-## The background worker
-
-A real tamagotchi gets hungry while you're not looking. SQL functions only run when called, so the aging logic needs a process of its own. Postgres has exactly this concept, the background worker. The postmaster starts it, supervises it, and restarts it if it crashes. Autovacuum and logical replication run on the same machinery, and extensions get to use it too.
-
-The worker lives in `src/worker.c`. Registration happens in `_PG_init` above.
-
-```c
-#include "postgres.h"
-
-#include "miscadmin.h"
-#include "postmaster/bgworker.h"
-#include "postmaster/interrupt.h"
-#include "storage/latch.h"
-#include "tcop/tcopprot.h"
-#include "utils/guc.h"
-#include "utils/wait_event.h"
-
-#include "pg_tamagotchi.h"
-
-PGDLLEXPORT void tama_worker_main(Datum main_arg);
-
-/* The pet's heartbeat. For now it only proves it's alive. */
-static void tama_tick(void) {
-  elog(LOG, "pg_tamagotchi: tick");
-}
-
-/* Worker entry point. Connects to one database, then ticks forever. */
-void tama_worker_main(Datum main_arg) {
-  uint32 wait_event_info;
-
-  pqsignal(SIGHUP, SignalHandlerForConfigReload);
-  pqsignal(SIGTERM, die);
-  BackgroundWorkerUnblockSignals();
-
-  BackgroundWorkerInitializeConnection(tama_database, NULL, 0);
-
-  wait_event_info = WaitEventExtensionNew("PgTamagotchiMain");
-
-  elog(LOG, "pg_tamagotchi: worker started, the pet lives in database \"%s\"",
-       tama_database);
-
-  while (true) {
-    tama_tick();
-
-    (void) WaitLatch(MyLatch,
-                     WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-                     tama_tick_interval * 1000L,
-                     wait_event_info);
-    ResetLatch(MyLatch);
-    CHECK_FOR_INTERRUPTS();
-
-    if (ConfigReloadPending) {
-      ConfigReloadPending = false;
-      ProcessConfigFile(PGC_SIGHUP);
-    }
-  }
-}
-```
-
-The tick is a placeholder for now, it just logs. The big ideas around it.
-
-- **Workers register at preload.** That's why `shared_preload_libraries` exists and why enabling a worker needs a restart.
-- **The postmaster supervises it.** It shows up in `pg_stat_activity` like any backend, gets restarted (or not, `BGW_NEVER_RESTART`) if it dies, and connects to one database like a normal session.
-- **The nap is a latch, not a sleep.** It wakes on a timer or instantly on a signal, so shutdown never waits for the tick interval.
-- **Signals are flags.** SIGHUP asks for a config reload, SIGTERM ends the worker through the standard `die` handler.
-- **GUCs are real settings.** `pg_tamagotchi.tick_interval` gets bounds, units, and a reload policy, change it with a config reload and the worker picks it up on its next nap.
-
-Proof of life.
-
-```
-$ just log
-LOG:  pg_tamagotchi: worker started, the pet lives in database "postgres"
-LOG:  pg_tamagotchi: tick
-LOG:  pg_tamagotchi: tick
-
-$ psql -c "SELECT pid, backend_type, datname, wait_event FROM pg_stat_activity
-           WHERE backend_type = 'pg_tamagotchi';"
-  pid  | backend_type  | datname  |    wait_event
--------+---------------+----------+------------------
- 64708 | pg_tamagotchi | postgres | PgTamagotchiMain
-```
-
-## The tick
-
-Time to make the placeholder do something. A tamagotchi reacts to how you treat it, and Postgres already keeps score of how you treat it, in the cumulative statistics views. So the tick reads those views and writes the pet.
-
-- dead tuples = poop, and `VACUUM` is the pooper scooper
-- cache hit ratio = mood
-- sessions sitting idle in transaction = stress
-- hunger just climbs, one point per tick
-
-```c
-static void tama_tick(void) {
-  int ret;
-
-  /*
-   * Workers have no client sending statements, so nothing advances the
-   * statement timestamp for us. Without this, now() in every tick
-   * returns the worker's start time, forever.
-   */
-  SetCurrentStatementStartTimestamp();
-  StartTransactionCommand();
-
-  /* Until CREATE EXTENSION runs in this database there is nothing to do */
-  if (!OidIsValid(get_extension_oid("pg_tamagotchi", true))) {
-    CommitTransactionCommand();
-    return;
-  }
-
-  SPI_connect();
-  PushActiveSnapshot(GetTransactionSnapshot());
-  pgstat_report_activity(STATE_RUNNING, "pg_tamagotchi tick");
-
-  ret = SPI_execute(psprintf(
-    "UPDATE %s SET"
-    "  hunger = least(hunger + 1, 100),"
-    "  poop = (SELECT coalesce(sum(n_dead_tup), 0)"
-    "          FROM pg_stat_user_tables),"
-    "  cache_hit_ratio = (SELECT blks_hit::float8"
-    "                            / nullif(blks_hit + blks_read, 0)"
-    "                     FROM pg_stat_database"
-    "                     WHERE datname = current_database()),"
-    "  stress = (SELECT count(*) FROM pg_stat_activity"
-    "            WHERE state = 'idle in transaction'),"
-    "  last_tick_at = now()",
-    tama_pet_relname()), false, 0);
-  if (ret != SPI_OK_UPDATE) {
-    elog(ERROR, "pg_tamagotchi: tick failed");
-  }
-
-  SPI_finish();
-  PopActiveSnapshot();
-  CommitTransactionCommand();
-  pgstat_report_activity(STATE_IDLE, NULL);
-}
-```
-
-The big ideas in the tick.
-
-- **The stats are just tables.** `pg_stat_user_tables`, `pg_stat_database`, and `pg_stat_activity` are queryable like anything else, so one UPDATE harvests them all.
-- **Workers run their own transactions.** A normal backend gets transaction handling from the client protocol loop. A worker does the dance itself, statement timestamp, begin, snapshot, commit.
-- **Time is transaction-scoped.** `now()` is the transaction timestamp, and only an incoming client statement normally advances the clock behind it. A worker has no client, so it stamps its own time with `SetCurrentStatementStartTimestamp`, otherwise `now()` stays frozen at process start.
-- **The guard.** The worker connects to its database whether or not the extension is installed there, so each tick first asks the catalog and naps if there's no egg yet.
-
-In the main loop, the tick gets a safety net. One failed tick should cost one log entry, not the pet's life.
-
-```c
-PG_TRY();
-{
-  tama_tick();
-}
-PG_CATCH();
-{
-  MemoryContextSwitchTo(worker_ctx);
-  EmitErrorReport();
-  FlushErrorState();
-  AbortCurrentTransaction();
-  pgstat_report_activity(STATE_IDLE, NULL);
-}
-PG_END_TRY();
-```
-
-`PG_TRY` is setjmp under the hood. It catches the `ERROR` longjmp, while FATAL (a shutdown request) still passes through and ends the worker like it should.
-
-And now the pet responds to how the database is treated.
-
-```
-postgres=# SELECT name, hunger, poop, stress, round(cache_hit_ratio::numeric, 3)
-           FROM tama.pet;
-   name   | hunger | poop | stress | round
-----------+--------+------+--------+-------
- Ticktock |     22 |    6 |      0 | 0.988
-
-postgres=# CREATE TABLE junk AS SELECT generate_series(1,1000) g;
-postgres=# DELETE FROM junk;
--- a tick later, poop = 1006
-
-postgres=# VACUUM junk;
--- a tick later, poop = 6
-```
-
-Leave a transaction hanging open in another terminal and stress climbs. Commit it and the pet calms down. The pet is a database monitor with feelings.
-
 ## Minting names
 
-One quality-of-life feature before the pet gets its looks. A nameless egg should still hatch, so `tama.hatch()` with no argument mints a pronounceable name by gluing syllables together, an onset, a vowel, sometimes a closing consonant. The randomness comes from `pg_prng`, the random number generator Postgres itself ships.
+One quality-of-life feature before the pet gets its looks: a nameless egg should still hatch.
+
+`tama.hatch()` with no argument mints a pronounceable name by gluing syllables together, an onset, a vowel, sometimes a closing consonant. The randomness comes from `pg_prng`, the random number generator Postgres itself ships.
 
 ```c
 /* Syllable parts for minting names. Every combination is pronounceable. */

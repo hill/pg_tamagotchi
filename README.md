@@ -4,7 +4,7 @@
   <img src="assets/readme-hero.png" alt="pg_tamagotchi PostgreSQL elephant virtual pet" />
 </p>
 
-A tamagotchi that lives in your Postgres database. Hatch it, name it, feed it, and try not to let a restore kill it.
+A tamagotchi that lives in your Postgres database. Hatch it, name it, feed it and don't kill it!
 
 ## Requirements
 
@@ -24,11 +24,14 @@ make install PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config
 CREATE EXTENSION pg_tamagotchi;
 
 SELECT tama.status();          -- a speckled egg, waiting
-SELECT tama.hatch('Ludo');   -- every pet needs a name (optionally leave blank and it will be invented)
+SELECT tama.hatch('Ludo');     -- every pet needs a name (optionally leave blank and it will be invented)
+SELECT tama.feed('apple');     -- snacks make them happy
+SELECT tama.talk('hello?');    -- they talk back
 SELECT tama.status();          -- check in on them
 ```
 
 One pet per database, and it's communal, any role can care for it. Hatching a second is refused.
+Talking stores both sides of the exchange in `tama.message`, so the conversation survives backup and restore with the pet.
 
 Watch them live from psql.
 
@@ -36,19 +39,6 @@ Watch them live from psql.
 SELECT tama.status();
 \watch 5
 ```
-
-
-## The background worker
-
-The pet ages on a timer driven by a background worker. Enable it by adding the library to your cluster's `postgresql.conf` and restarting.
-
-```
-shared_preload_libraries = 'pg_tamagotchi'
-pg_tamagotchi.tick_interval = '10s'   # how often the pet's state advances
-pg_tamagotchi.database = 'postgres'   # the database the pet lives in
-```
-
-Without the worker the extension still loads and the SQL functions work, the pet just doesn't age.
 
 ## Development
 

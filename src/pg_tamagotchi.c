@@ -1,86 +1,115 @@
 #include "postgres.h"
 
+#include <string.h>
+
 #include "commands/extension.h"
 #include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
-#include "miscadmin.h"
-#include "postmaster/bgworker.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
+#include "utils/float.h"
 #include "utils/lsyscache.h"
-
-#include "pg_tamagotchi.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_tamagotchi", .version = "0.1.0");
 
 PG_FUNCTION_INFO_V1(tama_hatch);
+PG_FUNCTION_INFO_V1(tama_feed);
+PG_FUNCTION_INFO_V1(tama_talk);
 PG_FUNCTION_INFO_V1(tama_status);
 
-int tama_tick_interval = 10;
-char *tama_database = NULL;
-
-/* Define GUCs and, when preloading, register the background worker. */
-void _PG_init(void) {
-  BackgroundWorker worker;
-
-  /* GUCs are defined whenever the library loads, by any backend */
-  DefineCustomIntVariable("pg_tamagotchi.tick_interval",
-                          "Seconds between pet ticks.",
-                          NULL,
-                          &tama_tick_interval,
-                          10, 1, 3600,
-                          PGC_SIGHUP,
-                          GUC_UNIT_S,
-                          NULL, NULL, NULL);
-
-  DefineCustomStringVariable("pg_tamagotchi.database",
-                             "Database the pet lives in.",
-                             NULL,
-                             &tama_database,
-                             "postgres",
-                             PGC_POSTMASTER,
-                             0,
-                             NULL, NULL, NULL);
-
-  MarkGUCPrefixReserved("pg_tamagotchi");
-
-  /* Workers can only be registered while the postmaster is preloading */
-  if (!process_shared_preload_libraries_in_progress) {
-    return;
-  }
-
-  memset(&worker, 0, sizeof(worker));
-  worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-  worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-
-  /*
-   * Never auto-restart. If the configured database doesn't exist the
-   * worker dies FATAL at connect; a restart interval would turn that
-   * one log line into an infinite crash loop the operator can only
-   * stop with a full cluster restart.
-   */
-  worker.bgw_restart_time = BGW_NEVER_RESTART;
-  snprintf(worker.bgw_library_name, sizeof(worker.bgw_library_name),
-           "pg_tamagotchi");
-  snprintf(worker.bgw_function_name, sizeof(worker.bgw_function_name),
-           "tama_worker_main");
-  snprintf(worker.bgw_name, sizeof(worker.bgw_name), "pg_tamagotchi worker");
-  snprintf(worker.bgw_type, sizeof(worker.bgw_type), "pg_tamagotchi");
-  RegisterBackgroundWorker(&worker);
-}
+#define TAMA_TICK_SECONDS 10
 
 /*
- * The pet table, qualified with whatever schema the extension actually
- * lives in. Hardcoding "tama.pet" would break if the schema is renamed,
- * and worse, would follow an impostor schema recreated under that name.
+ * A table qualified with whatever schema the extension actually lives in.
+ * Hardcoding "tama.pet" would break if the schema is renamed, and worse,
+ * would follow an impostor schema recreated under that name.
  */
-char *tama_pet_relname(void) {
+static char *tama_relname(const char *relname) {
   Oid extoid = get_extension_oid("pg_tamagotchi", false);
   char *nspname = get_namespace_name(get_extension_schema(extoid));
 
-  return psprintf("%s.pet", quote_identifier(nspname));
+  return psprintf("%s.%s", quote_identifier(nspname), quote_identifier(relname));
+}
+
+static char *tama_pet_relname(void) {
+  return tama_relname("pet");
+}
+
+static char *tama_message_relname(void) {
+  return tama_relname("message");
+}
+
+/*
+ * One beat of the pet's life. Time is caught up lazily when someone checks
+ * on the pet, so CREATE EXTENSION is enough to make it age.
+ *
+ * Stats become feelings here. Dead tuples are poop, idle-in-transaction
+ * sessions in this database are stress, and the change in buffer-cache hits
+ * since the last tick is mood. Using the delta rather than the lifetime
+ * ratio keeps the cache reading sensitive to recent activity, and the
+ * greatest(0, ...) guards keep it sane across a pg_stat_reset.
+ */
+static void tama_tick(void) {
+  char *relname = tama_pet_relname();
+  int ret;
+
+  ret = SPI_execute(psprintf(
+    "WITH stat AS ("
+    "  SELECT blks_hit AS cur_hit, blks_read AS cur_read"
+    "  FROM pg_stat_database WHERE datname = current_database()"
+    "),"
+    "tick AS ("
+    "  SELECT t.only_one, t.cache_hit_ratio AS old_ratio,"
+    "         greatest(0, stat.cur_hit - t.prev_blks_hit) AS d_hit,"
+    "         greatest(0, stat.cur_read - t.prev_blks_read) AS d_read,"
+    "         stat.cur_hit, stat.cur_read,"
+    "         greatest(0, floor(extract(epoch FROM"
+    "           (clock_timestamp() - t.last_tick_at)) / %d))::int AS elapsed"
+    "  FROM %s t, stat"
+    "  FOR UPDATE OF t"
+    ") "
+    "UPDATE %s p SET"
+    "  hunger = least(p.hunger + tick.elapsed, 100),"
+    "  poop = (SELECT coalesce(sum(n_dead_tup), 0)"
+    "          FROM pg_stat_user_tables),"
+    "  stress = (SELECT count(*) FROM pg_stat_activity"
+    "            WHERE state = 'idle in transaction'"
+    "              AND datname = current_database()),"
+    "  cache_hit_ratio = CASE WHEN tick.d_hit + tick.d_read > 0"
+    "    THEN tick.d_hit::float8 / (tick.d_hit + tick.d_read)"
+    "    ELSE tick.old_ratio END,"
+    "  prev_blks_hit = tick.cur_hit,"
+    "  prev_blks_read = tick.cur_read,"
+    "  last_tick_at = CASE WHEN tick.elapsed > 0"
+    "    THEN p.last_tick_at + tick.elapsed * (%d * interval '1 second')"
+    "    ELSE p.last_tick_at"
+    "  END"
+    " FROM tick"
+    " WHERE p.only_one = tick.only_one",
+    TAMA_TICK_SECONDS, relname, relname, TAMA_TICK_SECONDS),
+    false, 0);
+
+  if (ret != SPI_OK_UPDATE) {
+    elog(ERROR, "pg_tamagotchi: tick failed");
+  }
+}
+
+static void tama_log_message(const char *speaker, const char *body) {
+  Oid argtypes[2] = {TEXTOID, TEXTOID};
+  Datum values[2];
+  int ret;
+
+  values[0] = PointerGetDatum(cstring_to_text(speaker));
+  values[1] = PointerGetDatum(cstring_to_text(body));
+
+  ret = SPI_execute_with_args(
+    psprintf("INSERT INTO %s (speaker, body) VALUES ($1, $2)",
+             tama_message_relname()),
+    2, argtypes, values, NULL, false, 0);
+  if (ret != SPI_OK_INSERT) {
+    elog(ERROR, "could not remember the conversation");
+  }
 }
 
 /* Syllable parts for minting names. Every combination is pronounceable. */
@@ -193,6 +222,202 @@ Datum tama_hatch(PG_FUNCTION_ARGS) {
   PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 
+/* SELECT tama.feed(food). Lowers hunger and gives the pet a little joy. */
+Datum tama_feed(PG_FUNCTION_ARGS) {
+  char *food_cstr;
+  StringInfoData buf;
+  TupleDesc tupdesc;
+  HeapTuple tuple;
+  bool isnull;
+  char *name;
+  int32 hunger;
+  int32 happiness;
+  int ret;
+
+  if (PG_ARGISNULL(0)) {
+    food_cstr = "snack";
+  } else {
+    food_cstr = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  }
+
+  if (food_cstr[0] == '\0') {
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("food cannot be the empty string"),
+             errhint("Try SELECT tama.feed('apple'); or let "
+                     "tama.feed() pick a snack.")));
+  }
+
+  initStringInfo(&buf);
+
+  SPI_connect();
+
+  tama_tick();
+
+  ret = SPI_execute(psprintf(
+    "UPDATE %s SET"
+    "  hunger = greatest(hunger - 25, 0),"
+    "  happiness = least(happiness + CASE WHEN hunger > 0 THEN 5 ELSE 1 END, 100)"
+    " RETURNING name, hunger, happiness",
+    tama_pet_relname()), false, 1);
+  if (ret != SPI_OK_UPDATE_RETURNING) {
+    elog(ERROR, "could not feed the pet");
+  }
+
+  if (SPI_processed == 0) {
+    appendStringInfoString(&buf,
+                           "There is no pet to feed yet. "
+                           "SELECT tama.hatch('a name you like');\n");
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
+  }
+
+  tupdesc = SPI_tuptable->tupdesc;
+  tuple = SPI_tuptable->vals[0];
+  name = SPI_getvalue(tuple, tupdesc, 1);
+  hunger = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
+  happiness = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
+
+  appendStringInfo(&buf,
+                   "%s munches the %s. hunger %d/100  happiness %d/100\n",
+                   name, food_cstr, hunger, happiness);
+
+  SPI_finish();
+
+  PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
+}
+
+/* SELECT tama.talk(message). Stores the exchange and lets the pet answer. */
+Datum tama_talk(PG_FUNCTION_ARGS) {
+  char *message_cstr = NULL;
+  char *reply;
+  StringInfoData buf;
+  TupleDesc tupdesc;
+  HeapTuple tuple;
+  bool isnull;
+  bool cache_isnull;
+  char *name;
+  int32 hunger;
+  int32 happiness;
+  int64 poop;
+  int32 stress;
+  Datum cache_hit_datum;
+  float8 cache_hit_ratio = 1.0;
+  int ret;
+
+  if (!PG_ARGISNULL(0)) {
+    message_cstr = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    if (message_cstr[0] == '\0') {
+      ereport(ERROR,
+              (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+               errmsg("message cannot be the empty string"),
+               errhint("Try SELECT tama.talk('hello'); or call "
+                       "tama.talk() with no message.")));
+    }
+  }
+
+  initStringInfo(&buf);
+
+  SPI_connect();
+
+  tama_tick();
+
+  ret = SPI_execute(psprintf("SELECT name, hunger, happiness, poop, stress,"
+                             " cache_hit_ratio FROM %s",
+                             tama_pet_relname()),
+                    false, 1);
+  if (ret != SPI_OK_SELECT) {
+    elog(ERROR, "could not talk to the pet");
+  }
+
+  if (SPI_processed == 0) {
+    appendStringInfoString(&buf,
+                           "The egg is quiet. "
+                           "SELECT tama.hatch('a name you like');\n");
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
+  }
+
+  tupdesc = SPI_tuptable->tupdesc;
+  tuple = SPI_tuptable->vals[0];
+  name = SPI_getvalue(tuple, tupdesc, 1);
+  hunger = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
+  happiness = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
+  poop = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 4, &isnull));
+  stress = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
+  cache_hit_datum = SPI_getbinval(tuple, tupdesc, 6, &cache_isnull);
+  if (!cache_isnull) {
+    cache_hit_ratio = DatumGetFloat8(cache_hit_datum);
+  }
+
+  if (hunger >= 80) {
+    reply = psprintf("%s says: I am too hungry to think about query plans.",
+                     name);
+  } else if (stress > 0) {
+    reply = psprintf("%s says: I can hear %d idle transaction%s. Hold me.",
+                     name, stress, stress == 1 ? "" : "s");
+  } else if (poop >= 50) {
+    reply = psprintf("%s says: There are dead tuples everywhere. Vacuum day?",
+                     name);
+  } else if (!cache_isnull && cache_hit_ratio < 0.90) {
+    reply = psprintf("%s says: The buffer cache feels drafty today.", name);
+  } else if (happiness >= 90) {
+    reply = psprintf("%s says: I feel indexed and adored.", name);
+  } else if (message_cstr != NULL && strchr(message_cstr, '?') != NULL) {
+    reply = psprintf("%s says: That is a very good question for a tiny database pet.",
+                     name);
+  } else if (message_cstr == NULL) {
+    reply = psprintf("%s chirps from inside the database.", name);
+  } else {
+    reply = psprintf("%s says: I hear you. Also, I live in your database.",
+                     name);
+  }
+
+  if (message_cstr != NULL) {
+    tama_log_message("you", message_cstr);
+  }
+  tama_log_message("pet", reply);
+
+  if (message_cstr != NULL) {
+    appendStringInfo(&buf, "you: %s\n", message_cstr);
+  }
+  appendStringInfo(&buf, "%s\n", reply);
+
+  SPI_finish();
+
+  PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
+}
+
+/*
+ * A three-line creature whose eyes reflect the pet's mood, plus the matching
+ * mood word. The thresholds and order match the tama.vitals view exactly.
+ */
+static const char *tama_face(int32 hunger, int32 happiness, int64 poop,
+                             int32 stress, const char **mood_out) {
+  if (hunger >= 80) {
+    *mood_out = "hungry";
+    return " (\\_/)\n (>_<)\n (umu)";
+  }
+  if (stress > 0) {
+    *mood_out = "stressed";
+    return " (\\_/)\n (O_O)\n (;;;)";
+  }
+  if (poop >= 50) {
+    *mood_out = "grubby";
+    return " (\\_/)\n (-_-)\n (~~~)";
+  }
+  if (happiness >= 90) {
+    *mood_out = "delighted";
+    return " (\\_/)\n (^o^)\n (vwv)";
+  }
+  if (happiness <= 30) {
+    *mood_out = "sad";
+    return " (\\_/)\n (T_T)\n (._.)";
+  }
+  *mood_out = "content";
+  return " (\\_/)\n (o.o)\n (\" \")";
+}
+
 /* SELECT tama.status(). Renders the unhatched egg or the pet's vitals. */
 Datum tama_status(PG_FUNCTION_ARGS) {
   StringInfoData buf;
@@ -201,6 +426,8 @@ Datum tama_status(PG_FUNCTION_ARGS) {
   initStringInfo(&buf);
 
   SPI_connect();
+
+  tama_tick();
 
   ret = SPI_execute(psprintf("SELECT name, hunger, happiness, poop, stress"
                              " FROM %s", tama_pet_relname()),
@@ -223,13 +450,15 @@ Datum tama_status(PG_FUNCTION_ARGS) {
     int32 happiness = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
     int64 poop = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 4, &isnull));
     int32 stress = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
+    const char *mood;
+    const char *face = tama_face(hunger, happiness, poop, stress, &mood);
 
     appendStringInfo(&buf,
-                     " (\\_/)\n"
-                     " (o.o)  %s\n"
-                     " (\" \")  hunger %d/100  happiness %d/100"
+                     "%s\n"
+                     "%s is feeling %s.\n"
+                     "hunger %d/100  happiness %d/100"
                      "  stress %d  poop " INT64_FORMAT "\n",
-                     name, hunger, happiness, stress, poop);
+                     face, name, mood, hunger, happiness, stress, poop);
   }
 
   SPI_finish();

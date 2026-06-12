@@ -23,19 +23,89 @@ SELECT tama.hatch('Blobby');
 (1 row)
 
 -- fresh pet vitals
-SELECT tama.status();
-                          status                           
------------------------------------------------------------
-  (\_/)                                                   +
-  (o.o)  Blobby                                           +
-  (" ")  hunger 20/100  happiness 80/100  stress 0  poop 0+
- 
+SELECT tama.status() LIKE '%Blobby%' AS saw_pet;
+ saw_pet 
+---------
+ t
 (1 row)
 
-SELECT name, hunger, happiness, poop, stress FROM tama.pet;
-  name  | hunger | happiness | poop | stress 
---------+--------+-----------+------+--------
- Blobby |     20 |        80 |    0 |      0
+SELECT name, hunger, happiness, poop >= 0 AS poop_recorded,
+       stress >= 0 AS stress_recorded,
+       last_tick_at IS NOT NULL AS clock_started
+FROM tama.pet;
+  name  | hunger | happiness | poop_recorded | stress_recorded | clock_started 
+--------+--------+-----------+---------------+-----------------+---------------
+ Blobby |     20 |        80 | t             | t               | t
+(1 row)
+
+-- time passes when someone checks in
+UPDATE tama.pet SET last_tick_at = clock_timestamp() - interval '25 seconds';
+SELECT tama.status() LIKE '%hunger 22/100%' AS aged;
+ aged 
+------
+ t
+(1 row)
+
+SELECT hunger FROM tama.pet;
+ hunger 
+--------
+     22
+(1 row)
+
+-- feeding lowers hunger and makes the pet happier
+SELECT tama.feed('apple') LIKE '%apple%' AS fed;
+ fed 
+-----
+ t
+(1 row)
+
+SELECT hunger, happiness FROM tama.pet;
+ hunger | happiness 
+--------+-----------
+      0 |        85
+(1 row)
+
+-- talking stores both sides of the exchange
+SELECT tama.talk('hello?') LIKE '%Blobby%' AS talked;
+ talked 
+--------
+ t
+(1 row)
+
+SELECT speaker, count(*) AS messages, bool_and(body <> '') AS has_body
+FROM tama.message
+GROUP BY speaker
+ORDER BY speaker;
+ speaker | messages | has_body 
+---------+----------+----------
+ pet     |        1 | t
+ you     |        1 | t
+(2 rows)
+
+-- the vitals view summarises the pet without ticking it
+SELECT name = 'Blobby' AS named,
+       mood IN ('content', 'delighted', 'hungry', 'sad', 'stressed', 'grubby')
+         AS has_mood,
+       cache_hit_ratio IS NULL OR cache_hit_ratio BETWEEN 0 AND 1 AS ratio_sane,
+       dead_tuples >= 0 AS poop_counted
+FROM tama.vitals;
+ named | has_mood | ratio_sane | poop_counted 
+-------+----------+------------+--------------
+ t     | t        | t          | t
+(1 row)
+
+-- mood and face react to a hungry pet
+UPDATE tama.pet SET hunger = 95;
+SELECT tama.status() LIKE '%hungry%' AS looks_hungry;
+ looks_hungry 
+--------------
+ t
+(1 row)
+
+SELECT mood FROM tama.vitals;
+  mood  
+--------
+ hungry
 (1 row)
 
 -- one pet per database, enforced in C and by the schema
