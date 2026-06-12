@@ -112,7 +112,7 @@ static void tama_log_message(const char *speaker, const char *body) {
   }
 }
 
-/* Syllable parts for minting names. Every combination is pronounceable. */
+/* Syllable parts for building names. Every combination is pronounceable. */
 static const char *const name_onsets[] = {
   "b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n",
   "p", "r", "s", "t", "v", "w", "z", "br", "cr", "dr",
@@ -130,7 +130,7 @@ static int pick(int n) {
   return (int) pg_prng_uint64_range(&pg_global_prng_state, 0, n - 1);
 }
 
-/* Mint a pronounceable name, two or three syllables, capitalized. */
+/* Build a pronounceable name, two or three syllables, capitalized. */
 static char *tama_random_name(void) {
   StringInfoData buf;
   int syllables = 2 + pick(2);
@@ -157,7 +157,7 @@ Datum tama_hatch(PG_FUNCTION_ARGS) {
   Datum values[1];
   int ret;
 
-  /* A nameless egg gets a pronounceable name minted for it */
+  /* A nameless egg gets a pronounceable name built for it */
   if (PG_ARGISNULL(0)) {
     name_cstr = tama_random_name();
   } else {

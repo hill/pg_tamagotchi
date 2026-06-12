@@ -56,7 +56,7 @@ CREATE EXTENSION pg_tamagotchi;
 SELECT tama.hatch('Robert''); DROP TABLE tama.pet;--');
 SELECT name FROM tama.pet;
 
--- a nameless egg gets a pronounceable name minted for it
+-- a nameless egg gets a pronounceable name built for it
 DROP EXTENSION pg_tamagotchi;
 CREATE EXTENSION pg_tamagotchi;
 SELECT tama.hatch() LIKE '%hatched!%' AS hatched;
