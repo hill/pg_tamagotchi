@@ -33,7 +33,6 @@ SELECT * FROM tama.vitals;     -- the numbers behind the mood
 ```
 
 One pet per database, and it's communal, any role can care for it. Hatching a second is refused.
-Talking stores both sides of the exchange in `tama.message`, so the conversation survives backup and restore with the pet.
 
 Watch them live from psql.
 
@@ -41,6 +40,55 @@ Watch them live from psql.
 SELECT tama.status();
 \watch 5
 ```
+
+## See it react
+
+The pet mirrors the health of its database. Dead tuples are poop, so make a mess and clean it up. The stats views are asynchronous, so give them a second to catch up before you check in.
+
+```
+postgres=# SELECT tama.hatch('Ludo');
+ *crack*
+  (\_/)
+  (o.o)  Ludo hatched! Take good care of them.
+
+postgres=# SELECT tama.status();
+  (\_/)
+  (o.o)
+  (" ")
+ Ludo is feeling content.
+ hunger 20/100  happiness 80/100  stress 0  poop 0
+
+postgres=# CREATE TABLE junk AS SELECT generate_series(1,1000);
+postgres=# DELETE FROM junk;
+postgres=# SELECT tama.status();   -- a second later
+  (\_/)
+  (-_-)
+  (~~~)
+ Ludo is feeling grubby.
+ hunger 20/100  happiness 80/100  stress 0  poop 1001
+
+postgres=# VACUUM junk;
+postgres=# SELECT tama.status();   -- a second later
+  (\_/)
+  (o.o)
+  (" ")
+ Ludo is feeling content.
+ hunger 20/100  happiness 80/100  stress 0  poop 2
+
+postgres=# SELECT tama.feed('apple');
+ Ludo munches the apple. hunger 0/100  happiness 85/100
+
+postgres=# SELECT tama.talk('how are you?');
+ you: how are you?
+ Ludo says: That is a very good question for a tiny database pet.
+
+postgres=# SELECT name, age, hunger, happiness, dead_tuples, mood FROM tama.vitals;
+ name |   age    | hunger | happiness | dead_tuples |  mood
+------+----------+--------+-----------+-------------+---------
+ Ludo | 00:00:12 |      0 |        85 |           3 | content
+```
+
+Leave a transaction open in another session (`BEGIN; SELECT 1;`) and stress climbs, the eyes go wide. Let hunger build and the pet gets cranky. Feeding settles it.
 
 ## Development
 

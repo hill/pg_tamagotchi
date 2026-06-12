@@ -40,6 +40,26 @@ SELECT tama.status();          -- check in on them
 
 That's the whole setup. The pet ages whenever someone checks in, and conversations are stored in the database with the pet.
 
+The payoff is that the pet reflects the health of its database. Dead tuples are poop, so making a mess and cleaning it up shows on its face.
+
+```
+postgres=# DELETE FROM junk;      -- 1000 dead rows, a second to register
+postgres=# SELECT tama.status();
+  (\_/)
+  (-_-)
+  (~~~)
+ Ludo is feeling grubby.
+ hunger 20/100  happiness 80/100  stress 0  poop 1001
+
+postgres=# VACUUM junk;
+postgres=# SELECT tama.status();
+  (\_/)
+  (o.o)
+  (" ")
+ Ludo is feeling content.
+ hunger 20/100  happiness 80/100  stress 0  poop 2
+```
+
 ## What is a Postgres Extension?
 
 For a C-backed extension like this one, an extension is a name that ties together three artifacts.
