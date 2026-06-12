@@ -1,4 +1,4 @@
-# pg_tamagotchi: A tamagotchi that lives in your postgres instance.
+# pg_tamagotchi: A pet for your postgres db
 
 [Postgres](https://www.tigerdata.com/blog/its-2026-just-use-postgres) [can](https://postgresforeverything.com/) [do](https://www.amazingcto.com/postgres-for-everything/) [everything](https://www.justfuckingusepostgres.com/)!
 
@@ -107,10 +107,9 @@ GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON pet TO PUBLIC;
 ```
 
-A few interesting concepts hide in here.
 
 - The `name--version.sql` naming is how upgrades work. Postgres chains `0.1.0--0.2.0` scripts between versions itself.
-- Everything the script creates is owned by the extension, `DROP EXTENSION` takes it all with it.
+- Everything the script creates is owned by the extension, and `DROP EXTENSION` takes it all with it.
 - Extension tables are skipped by `pg_dump` unless marked as user data with `pg_extension_config_dump`, so the pet survives backups.
 - `LANGUAGE C` functions point at a symbol in the compiled library.
 - The bool primary key with a CHECK means the table can only ever hold one row. One pet per database, enforced by the schema itself.
@@ -141,61 +140,61 @@ PG_MODULE_MAGIC_EXT(.name = "pg_tamagotchi", .version = "0.1.0");
 PG_FUNCTION_INFO_V1(tama_hatch);
 PG_FUNCTION_INFO_V1(tama_status);
 
-int			tama_tick_interval = 10;
-char	   *tama_database = NULL;
+int tama_tick_interval = 10;
+char *tama_database = NULL;
 ```
 
 `_PG_init` runs once when the library loads. It defines two GUCs (Postgres's name for server settings) and registers the background worker.
 
 ```c
-void
-_PG_init(void)
-{
-	BackgroundWorker worker;
+/* Define GUCs and, when preloading, register the background worker. */
+void _PG_init(void) {
+  BackgroundWorker worker;
 
-	/* GUCs are defined whenever the library loads, by any backend */
-	DefineCustomIntVariable("pg_tamagotchi.tick_interval",
-							"Seconds between pet ticks.",
-							NULL,
-							&tama_tick_interval,
-							10, 1, 3600,
-							PGC_SIGHUP,
-							GUC_UNIT_S,
-							NULL, NULL, NULL);
+  /* GUCs are defined whenever the library loads, by any backend */
+  DefineCustomIntVariable("pg_tamagotchi.tick_interval",
+                          "Seconds between pet ticks.",
+                          NULL,
+                          &tama_tick_interval,
+                          10, 1, 3600,
+                          PGC_SIGHUP,
+                          GUC_UNIT_S,
+                          NULL, NULL, NULL);
 
-	DefineCustomStringVariable("pg_tamagotchi.database",
-							   "Database the pet lives in.",
-							   NULL,
-							   &tama_database,
-							   "postgres",
-							   PGC_POSTMASTER,
-							   0,
-							   NULL, NULL, NULL);
+  DefineCustomStringVariable("pg_tamagotchi.database",
+                             "Database the pet lives in.",
+                             NULL,
+                             &tama_database,
+                             "postgres",
+                             PGC_POSTMASTER,
+                             0,
+                             NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("pg_tamagotchi");
+  MarkGUCPrefixReserved("pg_tamagotchi");
 
-	/* Workers can only be registered while the postmaster is preloading */
-	if (!process_shared_preload_libraries_in_progress)
-		return;
+  /* Workers can only be registered while the postmaster is preloading */
+  if (!process_shared_preload_libraries_in_progress) {
+    return;
+  }
 
-	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+  memset(&worker, 0, sizeof(worker));
+  worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+  worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 
-	/*
-	 * Never auto-restart. If the configured database doesn't exist the
-	 * worker dies FATAL at connect; a restart interval would turn that
-	 * one log line into an infinite crash loop the operator can only
-	 * stop with a full cluster restart.
-	 */
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	snprintf(worker.bgw_library_name, sizeof(worker.bgw_library_name),
-			 "pg_tamagotchi");
-	snprintf(worker.bgw_function_name, sizeof(worker.bgw_function_name),
-			 "tama_worker_main");
-	snprintf(worker.bgw_name, sizeof(worker.bgw_name), "pg_tamagotchi worker");
-	snprintf(worker.bgw_type, sizeof(worker.bgw_type), "pg_tamagotchi");
-	RegisterBackgroundWorker(&worker);
+  /*
+   * Never auto-restart. If the configured database doesn't exist the
+   * worker dies FATAL at connect; a restart interval would turn that
+   * one log line into an infinite crash loop the operator can only
+   * stop with a full cluster restart.
+   */
+  worker.bgw_restart_time = BGW_NEVER_RESTART;
+  snprintf(worker.bgw_library_name, sizeof(worker.bgw_library_name),
+           "pg_tamagotchi");
+  snprintf(worker.bgw_function_name, sizeof(worker.bgw_function_name),
+           "tama_worker_main");
+  snprintf(worker.bgw_name, sizeof(worker.bgw_name), "pg_tamagotchi worker");
+  snprintf(worker.bgw_type, sizeof(worker.bgw_type), "pg_tamagotchi");
+  RegisterBackgroundWorker(&worker);
 }
 ```
 
@@ -207,185 +206,139 @@ A small helper resolves the extension's actual schema at runtime, rather than ha
  * lives in. Hardcoding "tama.pet" would break if the schema is renamed,
  * and worse, would follow an impostor schema recreated under that name.
  */
-static char *
-tama_pet_relname(void)
-{
-	Oid			extoid = get_extension_oid("pg_tamagotchi", false);
-	char	   *nspname = get_namespace_name(get_extension_schema(extoid));
+char *tama_pet_relname(void) {
+  Oid extoid = get_extension_oid("pg_tamagotchi", false);
+  char *nspname = get_namespace_name(get_extension_schema(extoid));
 
-	return psprintf("%s.pet", quote_identifier(nspname));
-}
-```
-
-When `hatch()` is called with no argument, a pronounceable name is minted from syllable parts using Postgres's own PRNG.
-
-```c
-/* Syllable parts for minting names. Every combination is pronounceable. */
-static const char *const name_onsets[] = {
-	"b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n",
-	"p", "r", "s", "t", "v", "w", "z", "br", "cr", "dr",
-	"fr", "gr", "pr", "tr", "st", "sl", "sp", "th", "ch"
-};
-static const char *const name_vowels[] = {
-	"a", "e", "i", "o", "u", "ai", "ee", "oo", "ou", "ia"
-};
-static const char *const name_codas[] = {"n", "r", "s", "t", "l", "k", "m"};
-
-#define NELEMS(a) ((int) (sizeof(a) / sizeof((a)[0])))
-
-static int
-pick(int n)
-{
-	return (int) pg_prng_uint64_range(&pg_global_prng_state, 0, n - 1);
-}
-
-static char *
-tama_random_name(void)
-{
-	StringInfoData buf;
-	int			syllables = 2 + pick(2);
-
-	initStringInfo(&buf);
-	for (int i = 0; i < syllables; i++)
-	{
-		appendStringInfoString(&buf, name_onsets[pick(NELEMS(name_onsets))]);
-		appendStringInfoString(&buf, name_vowels[pick(NELEMS(name_vowels))]);
-	}
-	if (pg_prng_double(&pg_global_prng_state) < 0.5)
-		appendStringInfoString(&buf, name_codas[pick(NELEMS(name_codas))]);
-
-	buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
-
-	return buf.data;
+  return psprintf("%s.pet", quote_identifier(nspname));
 }
 ```
 
 `tama_hatch` is the C side of `SELECT tama.hatch('Ludo')`. It picks a name (taking the argument or minting one), attempts a single insert, and renders some ASCII.
 
 ```c
-Datum
-tama_hatch(PG_FUNCTION_ARGS)
-{
-	char	   *name_cstr;
-	StringInfoData buf;
-	Oid			argtypes[1] = {TEXTOID};
-	Datum		values[1];
-	int			ret;
+/* SELECT tama.hatch(name). Creates the pet, refuses if one already exists. */
+Datum tama_hatch(PG_FUNCTION_ARGS) {
+  char *name_cstr;
+  StringInfoData buf;
+  Oid argtypes[1] = {TEXTOID};
+  Datum values[1];
+  int ret;
 
-	/* A nameless egg gets a pronounceable name minted for it */
-	if (PG_ARGISNULL(0))
-		name_cstr = tama_random_name();
-	else
-		name_cstr = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  /* A nameless egg gets a pronounceable name minted for it */
+  if (PG_ARGISNULL(0)) {
+    name_cstr = tama_random_name();
+  } else {
+    name_cstr = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  }
 
-	if (name_cstr[0] == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("a pet cannot be named the empty string"),
-				 errhint("Try SELECT tama.hatch('Blobby'); or let "
-						 "tama.hatch() pick a name.")));
+  if (name_cstr[0] == '\0') {
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("a pet cannot be named the empty string"),
+             errhint("Try SELECT tama.hatch('Blobby'); or let "
+                     "tama.hatch() pick a name.")));
+  }
 
-	/* The result buffer must outlive SPI's memory, so allocate it first. */
-	initStringInfo(&buf);
+  /* The result buffer must outlive SPI's memory, so allocate it first. */
+  initStringInfo(&buf);
 
-	SPI_connect();
+  SPI_connect();
 
-	/*
-	 * The insert itself is the authority on whether a pet exists. A
-	 * separate check-then-insert would race against concurrent hatches
-	 * and read a stale snapshot when called twice in one statement.
-	 */
-	values[0] = PointerGetDatum(cstring_to_text(name_cstr));
-	ret = SPI_execute_with_args(
-		psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
-				 tama_pet_relname()),
-		1, argtypes, values, NULL, false, 0);
-	if (ret != SPI_OK_INSERT)
-		elog(ERROR, "the egg refused to hatch");
+  /*
+   * The insert itself is the authority on whether a pet exists. A
+   * separate check-then-insert would race against concurrent hatches
+   * and read a stale snapshot when called twice in one statement.
+   */
+  values[0] = PointerGetDatum(cstring_to_text(name_cstr));
+  ret = SPI_execute_with_args(
+    psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
+             tama_pet_relname()),
+    1, argtypes, values, NULL, false, 0);
+  if (ret != SPI_OK_INSERT) {
+    elog(ERROR, "the egg refused to hatch");
+  }
 
-	if (SPI_processed == 0)
-	{
-		ret = SPI_execute(psprintf("SELECT name FROM %s", tama_pet_relname()),
-						  false, 1);
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "could not look in on the pet");
-		if (SPI_processed > 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNIQUE_VIOLATION),
-					 errmsg("you already have a pet named %s",
-							SPI_getvalue(SPI_tuptable->vals[0],
-										 SPI_tuptable->tupdesc, 1)),
-					 errhint("One pet per database. Care for the one you have.")));
-		ereport(ERROR,
-				(errcode(ERRCODE_UNIQUE_VIOLATION),
-				 errmsg("you already have a pet"),
-				 errhint("One pet per database. Care for the one you have.")));
-	}
+  if (SPI_processed == 0) {
+    ret = SPI_execute(psprintf("SELECT name FROM %s", tama_pet_relname()),
+                      false, 1);
+    if (ret != SPI_OK_SELECT) {
+      elog(ERROR, "could not look in on the pet");
+    }
+    if (SPI_processed > 0) {
+      ereport(ERROR,
+              (errcode(ERRCODE_UNIQUE_VIOLATION),
+               errmsg("you already have a pet named %s",
+                      SPI_getvalue(SPI_tuptable->vals[0],
+                                   SPI_tuptable->tupdesc, 1)),
+               errhint("One pet per database. Care for the one you have.")));
+    }
+    ereport(ERROR,
+            (errcode(ERRCODE_UNIQUE_VIOLATION),
+             errmsg("you already have a pet"),
+             errhint("One pet per database. Care for the one you have.")));
+  }
 
-	appendStringInfo(&buf,
-					 "*crack*\n"
-					 " (\\_/)\n"
-					 " (o.o)  %s hatched! Take good care of them.\n",
-					 name_cstr);
+  appendStringInfo(&buf,
+                   "*crack*\n"
+                   " (\\_/)\n"
+                   " (o.o)  %s hatched! Take good care of them.\n",
+                   name_cstr);
 
-	SPI_finish();
+  SPI_finish();
 
-	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
+  PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 ```
 
 `tama_status` is the read counterpart. It selects the single row and renders either an egg or a pet.
 
 ```c
-Datum
-tama_status(PG_FUNCTION_ARGS)
-{
-	StringInfoData buf;
-	int			ret;
+/* SELECT tama.status(). Renders the unhatched egg or the pet's vitals. */
+Datum tama_status(PG_FUNCTION_ARGS) {
+  StringInfoData buf;
+  int ret;
 
-	initStringInfo(&buf);
+  initStringInfo(&buf);
 
-	SPI_connect();
+  SPI_connect();
 
-	ret = SPI_execute(psprintf("SELECT name, hunger, happiness, poop, stress"
-							   " FROM %s", tama_pet_relname()),
-					  false, 1);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "could not look in on the pet");
+  ret = SPI_execute(psprintf("SELECT name, hunger, happiness, poop, stress"
+                             " FROM %s", tama_pet_relname()),
+                    false, 1);
+  if (ret != SPI_OK_SELECT) {
+    elog(ERROR, "could not look in on the pet");
+  }
 
-	if (SPI_processed == 0)
-	{
-		appendStringInfoString(&buf,
-							   "  _____\n"
-							   " /     \\   a speckled egg sits here, waiting.\n"
-							   " \\_____/   SELECT tama.hatch('a name you like');\n");
-	}
-	else
-	{
-		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-		HeapTuple	tuple = SPI_tuptable->vals[0];
-		bool		isnull;
-		char	   *name = SPI_getvalue(tuple, tupdesc, 1);
-		int32		hunger = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
-		int32		happiness = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
-		int64		poop = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 4, &isnull));
-		int32		stress = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
+  if (SPI_processed == 0) {
+    appendStringInfoString(&buf,
+                           "  _____\n"
+                           " /     \\   a speckled egg sits here, waiting.\n"
+                           " \\_____/   SELECT tama.hatch('a name you like');\n");
+  } else {
+    TupleDesc tupdesc = SPI_tuptable->tupdesc;
+    HeapTuple tuple = SPI_tuptable->vals[0];
+    bool isnull;
+    char *name = SPI_getvalue(tuple, tupdesc, 1);
+    int32 hunger = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
+    int32 happiness = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
+    int64 poop = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 4, &isnull));
+    int32 stress = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
 
-		appendStringInfo(&buf,
-						 " (\\_/)\n"
-						 " (o.o)  %s\n"
-						 " (\" \")  hunger %d/100  happiness %d/100"
-						 "  stress %d  poop " INT64_FORMAT "\n",
-						 name, hunger, happiness, stress, poop);
-	}
+    appendStringInfo(&buf,
+                     " (\\_/)\n"
+                     " (o.o)  %s\n"
+                     " (\" \")  hunger %d/100  happiness %d/100"
+                     "  stress %d  poop " INT64_FORMAT "\n",
+                     name, hunger, happiness, stress, poop);
+  }
 
-	SPI_finish();
+  SPI_finish();
 
-	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
+  PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 ```
 
-The big ideas in this file.
 
 - **The magic block.** `PG_MODULE_MAGIC_EXT` stamps the library with the Postgres version it was built for, and the server refuses to load a mismatch.
 - **The V1 calling convention.** Every value crossing the SQL/C boundary is a `Datum`, and the `PG_GETARG_*` / `PG_RETURN_*` macros pack and unpack them.
@@ -393,7 +346,6 @@ The big ideas in this file.
 - **SPI** is how C runs SQL inside the server, the same machinery PL/pgSQL uses. With `$1` parameters the pet's name is data, not SQL, so Bobby Tables is just a pet.
 - **Concurrency is settled by the index.** `ON CONFLICT DO NOTHING` makes the insert itself the authority on whether a pet exists, no racy check-then-insert.
 - **Ask the catalogs where you live.** The C resolves the extension's schema at call time instead of hardcoding `tama`, so a renamed schema doesn't break anything.
-- **Randomness comes from `pg_prng`.** Postgres ships its own PRNG, and a nameless egg uses it to mint a pronounceable name from syllable parts.
 
 ### Makefile
 
@@ -451,45 +403,41 @@ The worker lives in `src/worker.c`. Registration happens in `_PG_init` above.
 
 PGDLLEXPORT void tama_worker_main(Datum main_arg);
 
-static void
-tama_tick(void)
-{
-	elog(LOG, "pg_tamagotchi: tick");
+/* The pet's heartbeat. For now it only proves it's alive. */
+static void tama_tick(void) {
+  elog(LOG, "pg_tamagotchi: tick");
 }
 
-void
-tama_worker_main(Datum main_arg)
-{
-	uint32		wait_event_info;
+/* Worker entry point. Connects to one database, then ticks forever. */
+void tama_worker_main(Datum main_arg) {
+  uint32 wait_event_info;
 
-	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGTERM, die);
-	BackgroundWorkerUnblockSignals();
+  pqsignal(SIGHUP, SignalHandlerForConfigReload);
+  pqsignal(SIGTERM, die);
+  BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnection(tama_database, NULL, 0);
+  BackgroundWorkerInitializeConnection(tama_database, NULL, 0);
 
-	wait_event_info = WaitEventExtensionNew("PgTamagotchiMain");
+  wait_event_info = WaitEventExtensionNew("PgTamagotchiMain");
 
-	elog(LOG, "pg_tamagotchi: worker started, the pet lives in database \"%s\"",
-		 tama_database);
+  elog(LOG, "pg_tamagotchi: worker started, the pet lives in database \"%s\"",
+       tama_database);
 
-	while (true)
-	{
-		tama_tick();
+  while (true) {
+    tama_tick();
 
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 tama_tick_interval * 1000L,
-						 wait_event_info);
-		ResetLatch(MyLatch);
-		CHECK_FOR_INTERRUPTS();
+    (void) WaitLatch(MyLatch,
+                     WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                     tama_tick_interval * 1000L,
+                     wait_event_info);
+    ResetLatch(MyLatch);
+    CHECK_FOR_INTERRUPTS();
 
-		if (ConfigReloadPending)
-		{
-			ConfigReloadPending = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
-	}
+    if (ConfigReloadPending) {
+      ConfigReloadPending = false;
+      ProcessConfigFile(PGC_SIGHUP);
+    }
+  }
 }
 ```
 
@@ -515,3 +463,149 @@ $ psql -c "SELECT pid, backend_type, datname, wait_event FROM pg_stat_activity
 -------+---------------+----------+------------------
  64708 | pg_tamagotchi | postgres | PgTamagotchiMain
 ```
+
+## The tick
+
+Time to make the placeholder do something. A tamagotchi reacts to how you treat it, and Postgres already keeps score of how you treat it, in the cumulative statistics views. So the tick reads those views and writes the pet.
+
+- dead tuples = poop, and `VACUUM` is the pooper scooper
+- cache hit ratio = mood
+- sessions sitting idle in transaction = stress
+- hunger just climbs, one point per tick
+
+```c
+static void tama_tick(void) {
+  int ret;
+
+  /*
+   * Workers have no client sending statements, so nothing advances the
+   * statement timestamp for us. Without this, now() in every tick
+   * returns the worker's start time, forever.
+   */
+  SetCurrentStatementStartTimestamp();
+  StartTransactionCommand();
+
+  /* Until CREATE EXTENSION runs in this database there is nothing to do */
+  if (!OidIsValid(get_extension_oid("pg_tamagotchi", true))) {
+    CommitTransactionCommand();
+    return;
+  }
+
+  SPI_connect();
+  PushActiveSnapshot(GetTransactionSnapshot());
+  pgstat_report_activity(STATE_RUNNING, "pg_tamagotchi tick");
+
+  ret = SPI_execute(psprintf(
+    "UPDATE %s SET"
+    "  hunger = least(hunger + 1, 100),"
+    "  poop = (SELECT coalesce(sum(n_dead_tup), 0)"
+    "          FROM pg_stat_user_tables),"
+    "  cache_hit_ratio = (SELECT blks_hit::float8"
+    "                            / nullif(blks_hit + blks_read, 0)"
+    "                     FROM pg_stat_database"
+    "                     WHERE datname = current_database()),"
+    "  stress = (SELECT count(*) FROM pg_stat_activity"
+    "            WHERE state = 'idle in transaction'),"
+    "  last_tick_at = now()",
+    tama_pet_relname()), false, 0);
+  if (ret != SPI_OK_UPDATE) {
+    elog(ERROR, "pg_tamagotchi: tick failed");
+  }
+
+  SPI_finish();
+  PopActiveSnapshot();
+  CommitTransactionCommand();
+  pgstat_report_activity(STATE_IDLE, NULL);
+}
+```
+
+The big ideas in the tick.
+
+- **The stats are just tables.** `pg_stat_user_tables`, `pg_stat_database`, and `pg_stat_activity` are queryable like anything else, so one UPDATE harvests them all.
+- **Workers run their own transactions.** A normal backend gets transaction handling from the client protocol loop. A worker does the dance itself, statement timestamp, begin, snapshot, commit.
+- **Time is transaction-scoped.** `now()` is the transaction timestamp, and only an incoming client statement normally advances the clock behind it. A worker has no client, so it stamps its own time with `SetCurrentStatementStartTimestamp`, otherwise `now()` stays frozen at process start.
+- **The guard.** The worker connects to its database whether or not the extension is installed there, so each tick first asks the catalog and naps if there's no egg yet.
+
+In the main loop, the tick gets a safety net. One failed tick should cost one log entry, not the pet's life.
+
+```c
+PG_TRY();
+{
+  tama_tick();
+}
+PG_CATCH();
+{
+  MemoryContextSwitchTo(worker_ctx);
+  EmitErrorReport();
+  FlushErrorState();
+  AbortCurrentTransaction();
+  pgstat_report_activity(STATE_IDLE, NULL);
+}
+PG_END_TRY();
+```
+
+`PG_TRY` is setjmp under the hood. It catches the `ERROR` longjmp, while FATAL (a shutdown request) still passes through and ends the worker like it should.
+
+And now the pet responds to how the database is treated.
+
+```
+postgres=# SELECT name, hunger, poop, stress, round(cache_hit_ratio::numeric, 3)
+           FROM tama.pet;
+   name   | hunger | poop | stress | round
+----------+--------+------+--------+-------
+ Ticktock |     22 |    6 |      0 | 0.988
+
+postgres=# CREATE TABLE junk AS SELECT generate_series(1,1000) g;
+postgres=# DELETE FROM junk;
+-- a tick later, poop = 1006
+
+postgres=# VACUUM junk;
+-- a tick later, poop = 6
+```
+
+Leave a transaction hanging open in another terminal and stress climbs. Commit it and the pet calms down. The pet is a database monitor with feelings.
+
+## Minting names
+
+One quality-of-life feature before the pet gets its looks. A nameless egg should still hatch, so `tama.hatch()` with no argument mints a pronounceable name by gluing syllables together, an onset, a vowel, sometimes a closing consonant. The randomness comes from `pg_prng`, the random number generator Postgres itself ships.
+
+```c
+/* Syllable parts for minting names. Every combination is pronounceable. */
+static const char *const name_onsets[] = {
+  "b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n",
+  "p", "r", "s", "t", "v", "w", "z", "br", "cr", "dr",
+  "fr", "gr", "pr", "tr", "st", "sl", "sp", "th", "ch"
+};
+static const char *const name_vowels[] = {
+  "a", "e", "i", "o", "u", "ai", "ee", "oo", "ou", "ia"
+};
+static const char *const name_codas[] = {"n", "r", "s", "t", "l", "k", "m"};
+
+#define NELEMS(a) ((int) (sizeof(a) / sizeof((a)[0])))
+
+/* Uniform random index in [0, n). */
+static int pick(int n) {
+  return (int) pg_prng_uint64_range(&pg_global_prng_state, 0, n - 1);
+}
+
+/* Mint a pronounceable name, two or three syllables, capitalized. */
+static char *tama_random_name(void) {
+  StringInfoData buf;
+  int syllables = 2 + pick(2);
+
+  initStringInfo(&buf);
+  for (int i = 0; i < syllables; i++) {
+    appendStringInfoString(&buf, name_onsets[pick(NELEMS(name_onsets))]);
+    appendStringInfoString(&buf, name_vowels[pick(NELEMS(name_vowels))]);
+  }
+  if (pg_prng_double(&pg_global_prng_state) < 0.5) {
+    appendStringInfoString(&buf, name_codas[pick(NELEMS(name_codas))]);
+  }
+
+  buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
+
+  return buf.data;
+}
+```
+
+Praitreesleet, Broojar, Jeehee, Traboolai, Stotuzil and Saiprupai have all been born this way.
