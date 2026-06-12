@@ -21,7 +21,10 @@ Therefore, introducing...
 
 ## pg_tamagotchi
 
-pg_tamagotchi is your pet in postgres. You hatch it, name it, feed it, clean up it's shit and love and care for it. Furthermore, it integrates with your database statistics.
+pg_tamagotchi is your pet in postgres. You hatch it, name it, feed it, clean up it's shit and love and care for it.
+
+A pet's happiness usually is correlated with its environment,
+so we also monitor postgres statistics and your pet will respond.
 
 ### Care instructions
 
@@ -29,18 +32,23 @@ pg_tamagotchi is your pet in postgres. You hatch it, name it, feed it, clean up 
 CREATE EXTENSION pg_tamagotchi;
 
 SELECT tama.status();          -- a speckled egg, waiting
-SELECT tama.hatch('Blobby');   -- every pet needs a name
+SELECT tama.hatch('Ludo');     -- every pet needs a name
+-- (skip the argument and a pronounceable name is invented)
 SELECT tama.status();          -- check in on them
 ```
 
-One pet per database. Hatching a second is refused. Neglecting the first is, regrettably, allowed.
 
+## What is a Postgres Extension?
 
-## Building Posgres Extensions
+An extension is a name that ties together three artifacts.
 
-<!-- Concise notes, expand into prose later. -->
+1. A **control file** declaring the extension exists.
+2. A **SQL script** that creates the schema, tables, and function signatures.
+3. A **shared library** holding the compiled C those function signatures point at.
 
-An extension is a name that ties together three artifacts. `CREATE EXTENSION pg_tamagotchi` finds them by name in Postgres's install directories and wires them into the database.
+`CREATE EXTENSION pg_tamagotchi` finds them by name in Postgres's install directories and wires them into the database.
+
+_"Install directories"_ are the fixed locations on disk that pg will look for extension files. `pg_config --sharedir` will print the path for the _sharedir_ - where the control file and SQL scripts live. `pg_config --pkglibdir` is the directory where the compiled shared libraries (e.g. `.so` or `.dylib`) live.
 
 ### pg_tamagotchi.control
 
@@ -52,7 +60,7 @@ relocatable = false
 schema = tama
 ```
 
-The manifest. Lives in `$(pg_config --sharedir)/extension/`, which is how `CREATE EXTENSION pg_tamagotchi` finds the extension at all.
+This is the extension manifest. It lives in `$(pg_config --sharedir)/extension/`, which is how `CREATE EXTENSION pg_tamagotchi` finds the extension at all.
 
 - `comment` - shows up in `\dx`
 - `default_version` - which SQL script to run when no version is requested
@@ -84,7 +92,8 @@ CREATE TABLE pet (
 -- so the pet survives backup and restore.
 SELECT pg_catalog.pg_extension_config_dump('pet', '');
 
-CREATE FUNCTION hatch(name text) RETURNS text
+-- With no name, a pronounceable one is invented.
+CREATE FUNCTION hatch(name text DEFAULT NULL) RETURNS text
 AS 'MODULE_PATHNAME', 'tama_hatch'
 LANGUAGE C VOLATILE;
 
@@ -109,12 +118,13 @@ A few interesting concepts hide in here.
 
 ### src/pg_tamagotchi.c
 
-The compiled half.
+This is the compile C source code that function signatures link to.
 
 ```c
 #include "postgres.h"
 
 #include "commands/extension.h"
+#include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -198,30 +208,66 @@ tama_pet_relname(void)
 	return psprintf("%s.pet", quote_identifier(nspname));
 }
 
+/* Syllable parts for minting names. Every combination is pronounceable. */
+static const char *const name_onsets[] = {
+	"b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n",
+	"p", "r", "s", "t", "v", "w", "z", "br", "cr", "dr",
+	"fr", "gr", "pr", "tr", "st", "sl", "sp", "th", "ch"
+};
+static const char *const name_vowels[] = {
+	"a", "e", "i", "o", "u", "ai", "ee", "oo", "ou", "ia"
+};
+static const char *const name_codas[] = {"n", "r", "s", "t", "l", "k", "m"};
+
+#define NELEMS(a) ((int) (sizeof(a) / sizeof((a)[0])))
+
+static int
+pick(int n)
+{
+	return (int) pg_prng_uint64_range(&pg_global_prng_state, 0, n - 1);
+}
+
+static char *
+tama_random_name(void)
+{
+	StringInfoData buf;
+	int			syllables = 2 + pick(2);
+
+	initStringInfo(&buf);
+	for (int i = 0; i < syllables; i++)
+	{
+		appendStringInfoString(&buf, name_onsets[pick(NELEMS(name_onsets))]);
+		appendStringInfoString(&buf, name_vowels[pick(NELEMS(name_vowels))]);
+	}
+	if (pg_prng_double(&pg_global_prng_state) < 0.5)
+		appendStringInfoString(&buf, name_codas[pick(NELEMS(name_codas))]);
+
+	buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
+
+	return buf.data;
+}
+
 Datum
 tama_hatch(PG_FUNCTION_ARGS)
 {
-	text	   *name;
 	char	   *name_cstr;
 	StringInfoData buf;
 	Oid			argtypes[1] = {TEXTOID};
 	Datum		values[1];
 	int			ret;
 
+	/* A nameless egg gets a pronounceable name minted for it */
 	if (PG_ARGISNULL(0))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("your egg needs a name to hatch"),
-				 errhint("Try SELECT tama.hatch('Blobby');")));
-
-	name = PG_GETARG_TEXT_PP(0);
-	name_cstr = text_to_cstring(name);
+		name_cstr = tama_random_name();
+	else
+		name_cstr = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
 	if (name_cstr[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a pet cannot be named the empty string"),
-				 errhint("Try SELECT tama.hatch('Blobby');")));
+				 errhint("Try SELECT tama.hatch('Blobby'); or let "
+						 "tama.hatch() pick a name.")));
 
 	/* The result buffer must outlive SPI's memory, so allocate it first. */
 	initStringInfo(&buf);
@@ -233,7 +279,7 @@ tama_hatch(PG_FUNCTION_ARGS)
 	 * separate check-then-insert would race against concurrent hatches
 	 * and read a stale snapshot when called twice in one statement.
 	 */
-	values[0] = PointerGetDatum(name);
+	values[0] = PointerGetDatum(cstring_to_text(name_cstr));
 	ret = SPI_execute_with_args(
 		psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
 				 tama_pet_relname()),
@@ -327,6 +373,7 @@ The big ideas in this file.
 - **SPI** is how C runs SQL inside the server, the same machinery PL/pgSQL uses. With `$1` parameters the pet's name is data, not SQL, so Bobby Tables is just a pet.
 - **Concurrency is settled by the index.** `ON CONFLICT DO NOTHING` makes the insert itself the authority on whether a pet exists, no racy check-then-insert.
 - **Ask the catalogs where you live.** The C resolves the extension's schema at call time instead of hardcoding `tama`, so a renamed schema doesn't break anything.
+- **Randomness comes from `pg_prng`.** Postgres ships its own PRNG, and a nameless egg uses it to mint a pronounceable name from syllable parts.
 
 ### Makefile
 

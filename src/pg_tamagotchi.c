@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "commands/extension.h"
+#include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -84,30 +85,66 @@ tama_pet_relname(void)
 	return psprintf("%s.pet", quote_identifier(nspname));
 }
 
+/* Syllable parts for minting names. Every combination is pronounceable. */
+static const char *const name_onsets[] = {
+	"b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "n",
+	"p", "r", "s", "t", "v", "w", "z", "br", "cr", "dr",
+	"fr", "gr", "pr", "tr", "st", "sl", "sp", "th", "ch"
+};
+static const char *const name_vowels[] = {
+	"a", "e", "i", "o", "u", "ai", "ee", "oo", "ou", "ia"
+};
+static const char *const name_codas[] = {"n", "r", "s", "t", "l", "k", "m"};
+
+#define NELEMS(a) ((int) (sizeof(a) / sizeof((a)[0])))
+
+static int
+pick(int n)
+{
+	return (int) pg_prng_uint64_range(&pg_global_prng_state, 0, n - 1);
+}
+
+static char *
+tama_random_name(void)
+{
+	StringInfoData buf;
+	int			syllables = 2 + pick(2);
+
+	initStringInfo(&buf);
+	for (int i = 0; i < syllables; i++)
+	{
+		appendStringInfoString(&buf, name_onsets[pick(NELEMS(name_onsets))]);
+		appendStringInfoString(&buf, name_vowels[pick(NELEMS(name_vowels))]);
+	}
+	if (pg_prng_double(&pg_global_prng_state) < 0.5)
+		appendStringInfoString(&buf, name_codas[pick(NELEMS(name_codas))]);
+
+	buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
+
+	return buf.data;
+}
+
 Datum
 tama_hatch(PG_FUNCTION_ARGS)
 {
-	text	   *name;
 	char	   *name_cstr;
 	StringInfoData buf;
 	Oid			argtypes[1] = {TEXTOID};
 	Datum		values[1];
 	int			ret;
 
+	/* A nameless egg gets a pronounceable name minted for it */
 	if (PG_ARGISNULL(0))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("your egg needs a name to hatch"),
-				 errhint("Try SELECT tama.hatch('Blobby');")));
-
-	name = PG_GETARG_TEXT_PP(0);
-	name_cstr = text_to_cstring(name);
+		name_cstr = tama_random_name();
+	else
+		name_cstr = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
 	if (name_cstr[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a pet cannot be named the empty string"),
-				 errhint("Try SELECT tama.hatch('Blobby');")));
+				 errhint("Try SELECT tama.hatch('Blobby'); or let "
+						 "tama.hatch() pick a name.")));
 
 	/* The result buffer must outlive SPI's memory, so allocate it first. */
 	initStringInfo(&buf);
@@ -119,7 +156,7 @@ tama_hatch(PG_FUNCTION_ARGS)
 	 * separate check-then-insert would race against concurrent hatches
 	 * and read a stale snapshot when called twice in one statement.
 	 */
-	values[0] = PointerGetDatum(name);
+	values[0] = PointerGetDatum(cstring_to_text(name_cstr));
 	ret = SPI_execute_with_args(
 		psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
 				 tama_pet_relname()),

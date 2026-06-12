@@ -18,7 +18,8 @@ CREATE TABLE pet (
 -- so the pet survives backup and restore.
 SELECT pg_catalog.pg_extension_config_dump('pet', '');
 
-CREATE FUNCTION hatch(name text) RETURNS text
+-- With no name, a pronounceable one is invented.
+CREATE FUNCTION hatch(name text DEFAULT NULL) RETURNS text
 AS 'MODULE_PATHNAME', 'tama_hatch'
 LANGUAGE C VOLATILE;
 

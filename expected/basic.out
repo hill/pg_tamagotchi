@@ -9,13 +9,10 @@ SELECT tama.status();
  
 (1 row)
 
--- hatching requires a real name
-SELECT tama.hatch(NULL);
-ERROR:  your egg needs a name to hatch
-HINT:  Try SELECT tama.hatch('Blobby');
+-- the empty string is not a name
 SELECT tama.hatch('');
 ERROR:  a pet cannot be named the empty string
-HINT:  Try SELECT tama.hatch('Blobby');
+HINT:  Try SELECT tama.hatch('Blobby'); or let tama.hatch() pick a name.
 SELECT tama.hatch('Blobby');
                       hatch                      
 -------------------------------------------------
@@ -65,5 +62,22 @@ SELECT name FROM tama.pet;
                name               
 ----------------------------------
  Robert'); DROP TABLE tama.pet;--
+(1 row)
+
+-- a nameless egg gets a pronounceable name minted for it
+DROP EXTENSION pg_tamagotchi;
+CREATE EXTENSION pg_tamagotchi;
+SELECT tama.hatch() LIKE '%hatched!%' AS hatched;
+ hatched 
+---------
+ t
+(1 row)
+
+SELECT name ~ '^[A-Z][a-z]+$' AS pronounceable,
+       length(name) BETWEEN 4 AND 13 AS reasonable
+FROM tama.pet;
+ pronounceable | reasonable 
+---------------+------------
+ t             | t
 (1 row)
 
