@@ -43,7 +43,7 @@ SELECT tama.status();
 
 ## See it react
 
-The pet mirrors the health of its database. Dead tuples are poop, so make a mess and clean it up. The stats views are asynchronous, so give them a second to catch up before you check in.
+The pet mirrors the health of its database. When you update or delete a row, Postgres does not erase the old version, it leaves it behind as a dead tuple until `VACUUM` reclaims the space. The pet treats those dead tuples as poop, so deleting a thousand rows makes a mess and a `VACUUM` cleans it up. The statistics views are asynchronous, so give them a second to catch up before you check in.
 
 ```
 postgres=# SELECT tama.hatch('Ludo');
