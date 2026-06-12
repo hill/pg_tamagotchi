@@ -14,25 +14,13 @@ Build from source with PGXS, pointing `PG_CONFIG` at the server the pet will liv
 make install PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
-## The background worker
-
-The pet ages on a timer driven by a background worker. Enable it by adding the library to your cluster's `postgresql.conf` and restarting.
-
-```
-shared_preload_libraries = 'pg_tamagotchi'
-pg_tamagotchi.tick_interval = '10s'   # how often the pet's state advances
-pg_tamagotchi.database = 'postgres'   # the database the pet lives in
-```
-
-Without the worker the extension still loads and the SQL functions work, the pet just doesn't age.
-
 ## Care instructions
 
 ```sql
 CREATE EXTENSION pg_tamagotchi;
 
 SELECT tama.status();          -- a speckled egg, waiting
-SELECT tama.hatch('Blobby');   -- every pet needs a name (optionally leave blank and it will be invented)
+SELECT tama.hatch('Ludo');   -- every pet needs a name (optionally leave blank and it will be invented)
 SELECT tama.status();          -- check in on them
 ```
 
@@ -44,6 +32,19 @@ Watch them live from psql.
 SELECT tama.status();
 \watch 5
 ```
+
+
+## The background worker
+
+The pet ages on a timer driven by a background worker. Enable it by adding the library to your cluster's `postgresql.conf` and restarting.
+
+```
+shared_preload_libraries = 'pg_tamagotchi'
+pg_tamagotchi.tick_interval = '10s'   # how often the pet's state advances
+pg_tamagotchi.database = 'postgres'   # the database the pet lives in
+```
+
+Without the worker the extension still loads and the SQL functions work, the pet just doesn't age.
 
 ## Development
 
