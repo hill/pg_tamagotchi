@@ -87,7 +87,11 @@ CREATE TABLE pet (
     poop            bigint NOT NULL DEFAULT 0,
     stress          int NOT NULL DEFAULT 0,
     cache_hit_ratio float8,
-    last_tick_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+    last_tick_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
+    -- Cumulative cache counters at the last tick. The mood reads the
+    -- change since, not the lifetime average, so it tracks recent activity.
+    prev_blks_hit   bigint NOT NULL DEFAULT 0,
+    prev_blks_read  bigint NOT NULL DEFAULT 0
 );
 
 -- Conversation history with the pet. This is user data too.
@@ -119,11 +123,34 @@ CREATE FUNCTION status() RETURNS text
 AS 'MODULE_PATHNAME', 'tama_status'
 LANGUAGE C VOLATILE;
 
+-- A friendly summary of the pet. The mood thresholds match the faces
+-- drawn by status(), and the cache bookkeeping columns stay hidden.
+CREATE VIEW vitals AS
+SELECT
+    name,
+    clock_timestamp() - born_at        AS age,
+    hunger,
+    happiness,
+    poop                               AS dead_tuples,
+    stress                             AS idle_in_transaction,
+    round(cache_hit_ratio::numeric, 4) AS cache_hit_ratio,
+    CASE
+        WHEN hunger >= 80    THEN 'hungry'
+        WHEN stress > 0      THEN 'stressed'
+        WHEN poop >= 50      THEN 'grubby'
+        WHEN happiness >= 90 THEN 'delighted'
+        WHEN happiness <= 30 THEN 'sad'
+        ELSE 'content'
+    END                                AS mood,
+    last_tick_at
+FROM pet;
+
 -- The pet is communal. The functions run with the caller's privileges,
 -- so everyone needs real access to the schema and the table.
 GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON pet TO PUBLIC;
 GRANT SELECT, INSERT ON message TO PUBLIC;
+GRANT SELECT ON vitals TO PUBLIC;
 ```
 
 - The `name--version.sql` naming is how upgrades work. Postgres chains `0.1.0--0.2.0` scripts between versions itself.
@@ -133,6 +160,7 @@ GRANT SELECT, INSERT ON message TO PUBLIC;
 - The bool primary key with a CHECK means the table can only ever hold one row. One pet per database, enforced by the schema itself.
 - `last_tick_at` is the pet's clock. Since it is ordinary table state, it survives backup and restore with the rest of the pet.
 - `message` is the conversation log. `tama.talk()` writes one row for you and one row for the pet's reply.
+- `vitals` is a plain view over the pet. It derives the mood word and hides the cache bookkeeping, so reading the pet is one tidy row.
 - The functions run with the caller's privileges, so the script grants access. The pet is communal.
 
 ### src/pg_tamagotchi.c
@@ -190,44 +218,60 @@ static char *tama_message_relname(void) {
 The tick is the pet's heartbeat. It runs when someone checks `status()`, catches up by however many ten-second intervals have elapsed, and samples a few Postgres statistics.
 
 - dead tuples = poop, and `VACUUM` is the pooper scooper
-- cache hit ratio = environment
-- sessions sitting idle in transaction = stress
+- recent buffer-cache hits = environment
+- sessions sitting idle in transaction in this database = stress
 - hunger climbs one point per tick
 
 ```c
 /*
  * One beat of the pet's life. Time is caught up lazily when someone checks
  * on the pet, so CREATE EXTENSION is enough to make it age.
+ *
+ * Stats become feelings here. Dead tuples are poop, idle-in-transaction
+ * sessions in this database are stress, and the change in buffer-cache hits
+ * since the last tick is mood. Using the delta rather than the lifetime
+ * ratio keeps the cache reading sensitive to recent activity, and the
+ * greatest(0, ...) guards keep it sane across a pg_stat_reset.
  */
 static void tama_tick(void) {
   char *relname = tama_pet_relname();
   int ret;
 
   ret = SPI_execute(psprintf(
-    "WITH tick AS ("
-    "  SELECT only_one,"
+    "WITH stat AS ("
+    "  SELECT blks_hit AS cur_hit, blks_read AS cur_read"
+    "  FROM pg_stat_database WHERE datname = current_database()"
+    "),"
+    "tick AS ("
+    "  SELECT t.only_one, t.cache_hit_ratio AS old_ratio,"
+    "         greatest(0, stat.cur_hit - t.prev_blks_hit) AS d_hit,"
+    "         greatest(0, stat.cur_read - t.prev_blks_read) AS d_read,"
+    "         stat.cur_hit, stat.cur_read,"
     "         greatest(0, floor(extract(epoch FROM"
-    "           (clock_timestamp() - last_tick_at)) / %d))::int AS elapsed"
-    "  FROM %s"
-    "  FOR UPDATE"
+    "           (clock_timestamp() - t.last_tick_at)) / %d))::int AS elapsed"
+    "  FROM %s t, stat"
+    "  FOR UPDATE OF t"
     ") "
     "UPDATE %s p SET"
     "  hunger = least(p.hunger + tick.elapsed, 100),"
     "  poop = (SELECT coalesce(sum(n_dead_tup), 0)"
     "          FROM pg_stat_user_tables),"
-    "  cache_hit_ratio = (SELECT blks_hit::float8"
-    "                            / nullif(blks_hit + blks_read, 0)"
-    "                     FROM pg_stat_database"
-    "                     WHERE datname = current_database()),"
     "  stress = (SELECT count(*) FROM pg_stat_activity"
-    "            WHERE state = 'idle in transaction'),"
+    "            WHERE state = 'idle in transaction'"
+    "              AND datname = current_database()),"
+    "  cache_hit_ratio = CASE WHEN tick.d_hit + tick.d_read > 0"
+    "    THEN tick.d_hit::float8 / (tick.d_hit + tick.d_read)"
+    "    ELSE tick.old_ratio END,"
+    "  prev_blks_hit = tick.cur_hit,"
+    "  prev_blks_read = tick.cur_read,"
     "  last_tick_at = CASE WHEN tick.elapsed > 0"
     "    THEN p.last_tick_at + tick.elapsed * (%d * interval '1 second')"
     "    ELSE p.last_tick_at"
     "  END"
     " FROM tick"
     " WHERE p.only_one = tick.only_one",
-    TAMA_TICK_SECONDS, relname, relname, TAMA_TICK_SECONDS), false, 0);
+    TAMA_TICK_SECONDS, relname, relname, TAMA_TICK_SECONDS),
+    false, 0);
 
   if (ret != SPI_OK_UPDATE) {
     elog(ERROR, "pg_tamagotchi: tick failed");
@@ -240,6 +284,7 @@ The big ideas in the tick.
 - **The clock is data.** The pet does not need a separate process. `last_tick_at` records the last time its state advanced, and the next `status()` applies the missing time.
 - **The row lock is the timer guard.** `FOR UPDATE` locks the one pet row while elapsed time is calculated, so two people checking in at once do not both charge the same missing ticks.
 - **The stats are just tables.** `pg_stat_user_tables`, `pg_stat_database`, and `pg_stat_activity` are queryable like anything else, so one UPDATE harvests them all.
+- **The cache reading is a delta.** `pg_stat_database` counters only ever climb, so the lifetime ratio drifts toward a constant. Storing the previous counters and dividing the change since is how real monitoring samples them, and it keeps the mood responsive to recent activity.
 - **Dead tuples are old row versions.** Updates and deletes leave them behind until vacuum cleans them up. That maps cleanly to pet poop.
 - **Idle transactions are stressful.** A session sitting idle in transaction can hold old snapshots open and interfere with cleanup, so the pet notices.
 - **Use wall clock time.** `clock_timestamp()` is the actual time right now. That's what a pet wants.
@@ -282,7 +327,10 @@ Datum tama_hatch(PG_FUNCTION_ARGS) {
    */
   values[0] = PointerGetDatum(cstring_to_text(name_cstr));
   ret = SPI_execute_with_args(
-    psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
+    psprintf("INSERT INTO %s (name, prev_blks_hit, prev_blks_read)"
+             " SELECT $1, blks_hit, blks_read"
+             " FROM pg_stat_database WHERE datname = current_database()"
+             " ON CONFLICT DO NOTHING",
              tama_pet_relname()),
     1, argtypes, values, NULL, false, 0);
   if (ret != SPI_OK_INSERT) {
@@ -366,7 +414,41 @@ postgres=# SELECT speaker, body FROM tama.message ORDER BY said_at;
  pet     | Ludo says: That is a very good question for a tiny database pet.
 ```
 
-`tama_status` is the read counterpart. It advances the pet, selects the single row, and renders either an egg or the pet's vitals.
+The pet's mood drives its face. A small helper maps the vitals to a three-line creature and a matching word, in the same priority order the `tama.vitals` view uses.
+
+```c
+/*
+ * A three-line creature whose eyes reflect the pet's mood, plus the matching
+ * mood word. The thresholds and order match the tama.vitals view exactly.
+ */
+static const char *tama_face(int32 hunger, int32 happiness, int64 poop,
+                             int32 stress, const char **mood_out) {
+  if (hunger >= 80) {
+    *mood_out = "hungry";
+    return " (\\_/)\n (>_<)\n (umu)";
+  }
+  if (stress > 0) {
+    *mood_out = "stressed";
+    return " (\\_/)\n (O_O)\n (;;;)";
+  }
+  if (poop >= 50) {
+    *mood_out = "grubby";
+    return " (\\_/)\n (-_-)\n (~~~)";
+  }
+  if (happiness >= 90) {
+    *mood_out = "delighted";
+    return " (\\_/)\n (^o^)\n (vwv)";
+  }
+  if (happiness <= 30) {
+    *mood_out = "sad";
+    return " (\\_/)\n (T_T)\n (._.)";
+  }
+  *mood_out = "content";
+  return " (\\_/)\n (o.o)\n (\" \")";
+}
+```
+
+`tama_status` is the read counterpart. It advances the pet, selects the single row, and renders either an egg or the pet wearing its mood.
 
 ```c
 /* SELECT tama.status(). Renders the unhatched egg or the pet's vitals. */
@@ -401,13 +483,15 @@ Datum tama_status(PG_FUNCTION_ARGS) {
     int32 happiness = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
     int64 poop = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 4, &isnull));
     int32 stress = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
+    const char *mood;
+    const char *face = tama_face(hunger, happiness, poop, stress, &mood);
 
     appendStringInfo(&buf,
-                     " (\\_/)\n"
-                     " (o.o)  %s\n"
-                     " (\" \")  hunger %d/100  happiness %d/100"
+                     "%s\n"
+                     "%s is feeling %s.\n"
+                     "hunger %d/100  happiness %d/100"
                      "  stress %d  poop " INT64_FORMAT "\n",
-                     name, hunger, happiness, stress, poop);
+                     face, name, mood, hunger, happiness, stress, poop);
   }
 
   SPI_finish();
@@ -430,21 +514,32 @@ And now the pet responds to how the database is treated.
 
 ```
 postgres=# SELECT tama.status();
-                          status
------------------------------------------------------------
-  (\_/)
-  (o.o)  Ticktock
-  (" ")  hunger 22/100  happiness 80/100  stress 0  poop 6
+                       status
+----------------------------------------------------
+  (\_/)                                             +
+  (o.o)                                             +
+  (" ")                                             +
+ Ticktock is feeling content.                       +
+ hunger 20/100  happiness 80/100  stress 0  poop 0
 
 postgres=# CREATE TABLE junk AS SELECT generate_series(1,1000) g;
 postgres=# DELETE FROM junk;
--- check in later, poop = 1006
+-- check in later, poop = 1006, and the face turns grubby (-_-)
 
 postgres=# VACUUM junk;
--- check in later, poop = 6
+-- check in later, poop = 6, the pet is content again
 ```
 
-Leave a transaction hanging open in another terminal and stress climbs. Commit it and the pet calms down. The pet is a database monitor with feelings.
+Leave a transaction hanging open in another terminal and stress climbs, and the eyes go wide (O_O). Commit it and the pet calms down. The pet is a database monitor with feelings.
+
+For the numbers behind the face, `tama.vitals` is a plain view over the pet. It derives the same mood word the face uses and hides the cache bookkeeping, so you get a tidy dashboard row.
+
+```
+postgres=# SELECT name, age, hunger, happiness, dead_tuples, mood FROM tama.vitals;
+   name   |       age       | hunger | happiness | dead_tuples |   mood
+----------+-----------------+--------+-----------+-------------+-----------
+ Ticktock | 00:03:11.482    |     20 |        80 |           6 | content
+```
 
 ### Makefile
 
