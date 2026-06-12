@@ -181,10 +181,16 @@ Datum tama_hatch(PG_FUNCTION_ARGS) {
    * The insert itself is the authority on whether a pet exists. A
    * separate check-then-insert would race against concurrent hatches
    * and read a stale snapshot when called twice in one statement.
+   *
+   * Seed the cache counters from the live stats now, so the first tick
+   * measures activity since hatch rather than the database's lifetime.
    */
   values[0] = PointerGetDatum(cstring_to_text(name_cstr));
   ret = SPI_execute_with_args(
-    psprintf("INSERT INTO %s (name) VALUES ($1) ON CONFLICT DO NOTHING",
+    psprintf("INSERT INTO %s (name, prev_blks_hit, prev_blks_read)"
+             " SELECT $1, blks_hit, blks_read"
+             " FROM pg_stat_database WHERE datname = current_database()"
+             " ON CONFLICT DO NOTHING",
              tama_pet_relname()),
     1, argtypes, values, NULL, false, 0);
   if (ret != SPI_OK_INSERT) {

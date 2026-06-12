@@ -28,6 +28,8 @@ SELECT tama.hatch('Ludo');     -- every pet needs a name (optionally leave blank
 SELECT tama.feed('apple');     -- snacks make them happy
 SELECT tama.talk('hello?');    -- they talk back
 SELECT tama.status();          -- check in on them
+
+SELECT * FROM tama.vitals;     -- the numbers behind the mood
 ```
 
 One pet per database, and it's communal, any role can care for it. Hatching a second is refused.
