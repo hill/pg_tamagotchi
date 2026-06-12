@@ -56,8 +56,8 @@ The manifest. Lives in `$(pg_config --sharedir)/extension/`, which is how `CREAT
 
 - `comment` - shows up in `\dx`
 - `default_version` - which SQL script to run when no version is requested
-- `module_pathname` - where the compiled library lives. `$libdir` expands to Postgres's package library directory, and any `MODULE_PATHNAME` string in the SQL script gets substituted with this
-- `relocatable = false` + `schema = tama` - the extension owns a fixed schema. Postgres creates `tama` itself and runs the script with `search_path` pinned to it, so the script uses bare names. By convention, `pg_`-prefixed extensions drop the prefix for their schema, the way `pg_cron` gives you `cron.schedule()`. Ours is shortened further because you'll type it a lot.
+- `module_pathname` - where the compiled library lives, substituted for `MODULE_PATHNAME` in the SQL script
+- `relocatable = false` + `schema = tama` - the extension owns a fixed schema that Postgres creates for it. `pg_` extensions conventionally drop the prefix for the schema, like `pg_cron` and `cron.schedule()`
 
 ### pg_tamagotchi--0.1.0.sql
 
@@ -100,12 +100,12 @@ GRANT SELECT, INSERT, UPDATE ON pet TO PUBLIC;
 
 A few interesting concepts hide in here.
 
-- The `name--version.sql` naming is load-bearing. Upgrades work by chaining scripts (`pg_tamagotchi--0.1.0--0.2.0.sql`) and Postgres finds the path between any two versions itself.
-- Every object the script creates is *owned* by the extension. `DROP EXTENSION` removes them all, `\dx+` lists them, and you can't accidentally drop just the table out from under it.
-- Extension-owned tables are skipped by `pg_dump` on the theory that they're furniture, recreatable from the script. Pet state is not furniture. `pg_extension_config_dump('pet', '')` marks its contents as user data so a backup doesn't kill the pet.
-- `CREATE FUNCTION ... LANGUAGE C` is the bridge to the compiled half. `'MODULE_PATHNAME', 'tama_hatch'` tells Postgres to dlopen the library named in the control file and look up the symbol `tama_hatch`.
-- The single-row-table trick. A `bool` primary key defaulting to `true` with `CHECK (only_one)` can only ever hold one row, since a second insert violates the unique constraint. The schema itself enforces one pet per database.
-- `LANGUAGE C` functions are not `SECURITY DEFINER` by default, they run with the caller's privileges. Without the `GRANT`s, any role other than the installer would get into the function and then hit a raw permission error on the schema. `@extschema@` is substituted with the extension's schema when the script runs.
+- The `name--version.sql` naming is how upgrades work. Postgres chains `0.1.0--0.2.0` scripts between versions itself.
+- Everything the script creates is owned by the extension, `DROP EXTENSION` takes it all with it.
+- Extension tables are skipped by `pg_dump` unless marked as user data with `pg_extension_config_dump`, so the pet survives backups.
+- `LANGUAGE C` functions point at a symbol in the compiled library.
+- The bool primary key with a CHECK means the table can only ever hold one row. One pet per database, enforced by the schema itself.
+- The functions run with the caller's privileges, so the script grants access. The pet is communal.
 
 ### src/pg_tamagotchi.c
 
@@ -319,15 +319,14 @@ tama_status(PG_FUNCTION_ARGS)
 }
 ```
 
-This file is dense with Postgres internals.
+The big ideas in this file.
 
-- **The magic block.** `PG_MODULE_MAGIC_EXT` bakes a struct into the library recording the Postgres major version and ABI-relevant build options. Postgres checks it at dlopen time and refuses mismatched binaries. The `_EXT` variant is new in PG 18 and also registers the name and version in `pg_get_loaded_modules()`.
-- **The V1 calling convention.** `PG_FUNCTION_INFO_V1(tama_hatch)` plus the fixed signature `Datum tama_hatch(PG_FUNCTION_ARGS)`. Every value crossing the SQL/C boundary is a `Datum`, one pointer-sized blob that might hold an int inline or point to a length-prefixed "varlena" value like `text`. The `PG_GETARG_*` and `PG_RETURN_*` macros do the packing and unpacking.
-- **Errors don't return.** `ereport(ERROR, ...)` longjmps out of the function entirely and aborts the transaction. Notice there's no cleanup code on the error paths, nothing closes the SPI connection or frees the buffer. That isn't sloppiness. All that memory belongs to a memory context the transaction abort destroys wholesale. `errcode`, `errmsg`, and `errhint` become the ERROR and HINT lines you see in psql.
-- **palloc, never free.** Postgres memory is arena-allocated in a tree of contexts, per-query, per-transaction, and so on. Everything here allocates from the current context and nobody frees anything. The context reset does it.
-- **SPI**, the Server Programming Interface, is how C code runs SQL inside the server. It's the same machinery PL/pgSQL uses. `SPI_execute` runs the query, then `SPI_processed` holds the row count, `SPI_tuptable` the results, and `SPI_getbinval` pulls out one column as a Datum.
-- **Parameterized queries from C.** `SPI_execute_with_args` with `$1` means the pet's name is never spliced into SQL text, so `hatch('Robert''); DROP TABLE pet;--')` is a pet with a weird name, not little Bobby Tables.
-- **Memory context choreography.** `initStringInfo(&buf)` happens before `SPI_connect` on purpose. SPI runs in its own memory arena that `SPI_finish` destroys, but `repalloc` keeps a chunk in the context where it was born, so a buffer allocated before SPI survives appends made during SPI and is still valid after.
+- **The magic block.** `PG_MODULE_MAGIC_EXT` stamps the library with the Postgres version it was built for, and the server refuses to load a mismatch.
+- **The V1 calling convention.** Every value crossing the SQL/C boundary is a `Datum`, and the `PG_GETARG_*` / `PG_RETURN_*` macros pack and unpack them.
+- **Errors don't return.** `ereport(ERROR)` longjmps out and aborts the transaction. No cleanup code needed, because everything was palloc'd in a memory context the abort destroys wholesale.
+- **SPI** is how C runs SQL inside the server, the same machinery PL/pgSQL uses. With `$1` parameters the pet's name is data, not SQL, so Bobby Tables is just a pet.
+- **Concurrency is settled by the index.** `ON CONFLICT DO NOTHING` makes the insert itself the authority on whether a pet exists, no racy check-then-insert.
+- **Ask the catalogs where you live.** The C resolves the extension's schema at call time instead of hardcoding `tama`, so a renamed schema doesn't break anything.
 
 ### Makefile
 
@@ -425,14 +424,13 @@ tama_worker_main(Datum main_arg)
 }
 ```
 
-The tick is a placeholder for now, it just logs. The interesting parts are around it.
+The tick is a placeholder for now, it just logs. The big ideas around it.
 
-- **Registration only works at preload.** Workers must be registered while the postmaster processes `shared_preload_libraries`, so the library has to be in that list and changing it needs a full restart. A replaced library file on disk also only takes effect at restart, because every backend inherits the postmaster's already-loaded image via fork.
-- **The registration struct does a lot.** `bgw_type` becomes `backend_type` in `pg_stat_activity`. `BGWORKER_BACKEND_DATABASE_CONNECTION` lets it connect to one database like a real backend, which is what `pg_tamagotchi.database` points at. `bgw_restart_time` is a trap, a restart interval sounds like resilience, but if the configured database doesn't exist the worker dies FATAL at connect and the postmaster would relaunch it into the same FATAL forever. `BGW_NEVER_RESTART` keeps a misconfiguration at one log line, and it's what the in-tree `worker_spi` example uses too.
-- **The nap is a latch, not a sleep.** `WaitLatch` wakes on a timeout like sleep would, but also instantly when something sets the latch, like the signal handlers do. Shutdown is immediate instead of "up to tick_interval later". `WL_EXIT_ON_PM_DEATH` kills the worker if the postmaster vanishes, so it can never outlive the server.
-- **Named wait events.** `WaitEventExtensionNew("PgTamagotchiMain")` registers the name monitoring tools see while the worker naps. Our pet shows up in `pg_stat_activity` as `Extension / PgTamagotchiMain`, right next to the built-in wait events.
-- **Signals are flags, mostly.** SIGHUP sets `ConfigReloadPending` and the loop reloads config when it notices. SIGTERM is wired to `die`, the standard backend handler, which raises FATAL at the next `CHECK_FOR_INTERRUPTS()`. The shutdown log line reads `FATAL: terminating background worker "pg_tamagotchi" due to administrator command`, which looks alarming and is the system working as designed.
-- **GUCs are real settings.** `DefineCustomIntVariable` gives `pg_tamagotchi.tick_interval` bounds, units (you can write `'30s'` or `'5min'`), and a change policy. `PGC_SIGHUP` means a config reload is enough, and the worker picks the new value up on its next nap. The database setting is `PGC_POSTMASTER` because the worker connects exactly once at startup. `MarkGUCPrefixReserved` turns misspelled settings into warnings instead of silent no-ops.
+- **Workers register at preload.** That's why `shared_preload_libraries` exists and why enabling a worker needs a restart.
+- **The postmaster supervises it.** It shows up in `pg_stat_activity` like any backend, gets restarted (or not, `BGW_NEVER_RESTART`) if it dies, and connects to one database like a normal session.
+- **The nap is a latch, not a sleep.** It wakes on a timer or instantly on a signal, so shutdown never waits for the tick interval.
+- **Signals are flags.** SIGHUP asks for a config reload, SIGTERM ends the worker through the standard `die` handler.
+- **GUCs are real settings.** `pg_tamagotchi.tick_interval` gets bounds, units, and a reload policy, change it with a config reload and the worker picks it up on its next nap.
 
 Proof of life.
 
@@ -448,12 +446,3 @@ $ psql -c "SELECT pid, backend_type, datname, wait_event FROM pg_stat_activity
 -------+---------------+----------+------------------
  64708 | pg_tamagotchi | postgres | PgTamagotchiMain
 ```
-
-## Sharp edges an adversarial review caught
-
-<!-- notes; a fleet of review agents went over the C and confirmed these, each is a concept worth a paragraph -->
-
-- Check-then-insert is a race. The original `hatch()` did SELECT then INSERT, so two concurrent hatches both passed the check and the loser got a raw `pet_pkey` violation instead of the friendly error. Worse, the check ran with `read_only=true`, which reuses the statement's snapshot, so `SELECT tama.hatch(n) FROM (VALUES ('a'),('b')) v(n)` slipped past it too. `INSERT ... ON CONFLICT DO NOTHING` made the insert itself the authority.
-- A worker restart interval sounds like resilience and is actually a crash loop when the failure is deterministic, like a missing database. `BGW_NEVER_RESTART`.
-- C functions run with the caller's privileges. Defaults gave other roles EXECUTE on the functions but no access to the schema behind them, a confusing half-open door. The script now grants real access on purpose.
-- Hardcoding `tama.pet` in the C breaks if someone renames the schema, and the extension can't stop them, the schema isn't an extension member even though `CREATE EXTENSION` made it. The C now resolves the schema from the catalogs (`get_extension_oid`, `get_extension_schema`) at call time.
