@@ -4,7 +4,7 @@
   <img src="assets/readme-hero.png" alt="pg_tamagotchi PostgreSQL elephant virtual pet" />
 </p>
 
-A tamagotchi that lives in your Postgres database. Hatch it, name it, feed it and don't kill it!
+A tamagotchi that lives in your Postgres database.
 
 ## Requirements
 
@@ -32,8 +32,6 @@ SELECT tama.status();          -- check in on them
 SELECT * FROM tama.vitals;     -- the numbers behind the mood
 ```
 
-One pet per database, and it's communal, any role can care for it. Hatching a second is refused.
-
 Watch them live from psql.
 
 ```
@@ -42,8 +40,6 @@ SELECT tama.status();
 ```
 
 ## See it react
-
-The pet mirrors the health of its database. When you update or delete a row, Postgres does not erase the old version, it leaves it behind as a dead tuple until `VACUUM` reclaims the space. The pet treats those dead tuples as poop, so deleting a thousand rows makes a mess and a `VACUUM` cleans it up. The statistics views are asynchronous, so give them a second to catch up before you check in.
 
 ```
 postgres=# SELECT tama.hatch('Ludo');
@@ -88,11 +84,7 @@ postgres=# SELECT name, age, hunger, happiness, dead_tuples, mood FROM tama.vita
  Ludo | 00:00:12 |      0 |        85 |           3 | content
 ```
 
-Leave a transaction open in another session (`BEGIN; SELECT 1;`) and stress climbs, the eyes go wide. Let hunger build and the pet gets cranky. Feeding settles it.
-
 ## Development
-
-The justfile drives a throwaway cluster in `./pgdata` on port 5499, so your real Postgres is never touched.
 
 ```bash
 just install   # build and install via PGXS
